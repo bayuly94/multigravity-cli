@@ -783,7 +783,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         exit 0
     }
 
-    "new""new" {
+    "new" {
         $profileName = $RemainingArgs[0]
         if (-not $profileName) { Show-Help; exit 1 }
         $targetDir = Join-Path $ProfilesDir $profileName
