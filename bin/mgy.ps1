@@ -329,10 +329,21 @@ if imported_id:
 function Get-ProfileTokenAccount([string]$TokenJson) {
     if (-not $TokenJson) { return $null }
     try {
-        $obj = $TokenJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        $clean = $TokenJson.Trim().TrimStart([char]0xFEFF)
+        if ($clean.StartsWith("go-keyring-base64:")) {
+            $b64 = $clean.Substring("go-keyring-base64:".Length)
+            $bytes = [System.Convert]::FromBase64String($b64)
+            $clean = [System.Text.Encoding]::UTF8.GetString($bytes)
+        }
+        $obj = $clean | ConvertFrom-Json -ErrorAction SilentlyContinue
         if ($obj.id_token_email) { return $obj.id_token_email }
-        if ($obj.id_token -and $obj.id_token.Contains(".")) {
-            $parts = $obj.id_token.Split(".")
+        if ($obj.email) { return $obj.email }
+        $idToken = $obj.id_token
+        if (-not $idToken -and $obj.token -and $obj.token.id_token) {
+            $idToken = $obj.token.id_token
+        }
+        if ($idToken -and $idToken.Contains(".")) {
+            $parts = $idToken.Split(".")
             if ($parts.Length -gt 1) {
                 $payload = $parts[1]
                 $mod = $payload.Length % 4
@@ -348,6 +359,50 @@ function Get-ProfileTokenAccount([string]$TokenJson) {
         }
     } catch {}
     return $null
+}
+
+function Get-ProfileAccount([string]$ProfilePath) {
+    $tokenCandidates = @(
+        (Join-Path $ProfilePath ".tokens\credential.txt"),
+        (Join-Path $ProfilePath ".tokens\token.json"),
+        (Join-Path $ProfilePath "antigravity-oauth-token"),
+        (Join-Path $ProfilePath ".gemini\antigravity-cli\antigravity-oauth-token")
+    )
+    foreach ($cand in $tokenCandidates) {
+        if (Test-Path $cand) {
+            try {
+                $raw = [System.IO.File]::ReadAllText($cand, [System.Text.Encoding]::UTF8)
+                $account = Get-ProfileTokenAccount $raw
+                if ($account) { return $account }
+            } catch {}
+        }
+    }
+    return $null
+}
+
+function Show-ProfilesList {
+    Write-Host "Available profiles:" -ForegroundColor Cyan
+    if ((Test-Path $ProfilesDir) -and (Get-ChildItem -Path $ProfilesDir -Directory -ErrorAction SilentlyContinue)) {
+        $dirs = @(Get-ChildItem -Path $ProfilesDir -Directory | Where-Object { -not $_.Name.StartsWith(".") })
+        if ($dirs.Count -gt 0) {
+            $maxLen = ($dirs | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
+            foreach ($d in $dirs) {
+                $account = Get-ProfileAccount $d.FullName
+                $paddedName = $d.Name.PadRight($maxLen)
+                Write-Host "  • " -NoNewline
+                Write-Host $paddedName -NoNewline -ForegroundColor White
+                if ($account) {
+                    Write-Host "  ($account)" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  (not authenticated)" -ForegroundColor DarkYellow
+                }
+            }
+        } else {
+            Write-Host "  (no profiles found)" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "  (no profiles found)" -ForegroundColor DarkGray
+    }
 }
 
 function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
@@ -468,12 +523,7 @@ switch -Wildcard ($Command) {
     ""     { Show-Help; exit 1 }
 
     "list" {
-        Write-Host "Available profiles:" -ForegroundColor Cyan
-        if ((Test-Path $ProfilesDir) -and (Get-ChildItem -Path $ProfilesDir -Directory -ErrorAction SilentlyContinue)) {
-            Get-ChildItem -Path $ProfilesDir -Directory | ForEach-Object { Write-Host "  • $($_.Name)" }
-        } else {
-            Write-Host "  (no profiles found)" -ForegroundColor DarkGray
-        }
+        Show-ProfilesList
     }
 
     "fork" {
@@ -975,8 +1025,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
                 exit 1
             } else {
                 Write-Error "Multiple profiles found. Please specify which profile to run: mgy <profile> $Command $($RemainingArgs -join ' ')"
-                Write-Host "Available profiles:"
-                foreach ($p in $profiles) { Write-Host "  • $p" }
+                Show-ProfilesList
                 exit 1
             }
         }
