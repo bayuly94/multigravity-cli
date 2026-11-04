@@ -495,10 +495,15 @@ case "$1" in
         setup_profile_environment "$TARGET_DIR"
 
         echo "Setting up profile '$PROFILE_NAME'..."
-        # agy authenticates automatically on startup when unauthenticated.
-        # -p "/quota" triggers OAuth login in the browser/terminal and displays quotas once authenticated.
-        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy -p "/quota" || USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy || true
-        echo "Profile '$PROFILE_NAME' is ready!"
+        # Launch agy in interactive mode to authenticate without the 60s headless timeout
+        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy
+
+        if is_profile_authenticated "$TARGET_DIR"; then
+            echo "Profile '$PROFILE_NAME' is ready!"
+        else
+            echo "Profile '$PROFILE_NAME' was created, but not yet authenticated."
+            echo "Run 'mgy $PROFILE_NAME' whenever you're ready to sign in."
+        fi
         ;;
 
     import)

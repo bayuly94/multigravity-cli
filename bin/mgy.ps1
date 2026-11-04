@@ -833,7 +833,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         exit 0
     }
 
-    "new""new" {
+    "new" {
         $profileName = $RemainingArgs[0]
         if (-not $profileName) { Show-Help; exit 1 }
         $targetDir = Join-Path $ProfilesDir $profileName
@@ -864,12 +864,8 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         try {
             $env:USERPROFILE = $targetDir
             $env:HOME = $targetDir
-            # agy authenticates automatically on startup when unauthenticated.
-            # -p "/quota" triggers OAuth login in the browser/terminal and displays quotas once authenticated.
-            & agy -p "/quota"
-            if ($LASTEXITCODE -ne 0) {
-                & agy
-            }
+            # Launch agy in interactive mode to authenticate without the 60s headless timeout
+            & agy
         } finally {
             if ($hasWinCred) {
                 $savedCred = [WinCredManager]::ReadCredential("gemini:antigravity")
