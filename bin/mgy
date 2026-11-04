@@ -196,7 +196,9 @@ for name in entries:
             if isinstance(payload, dict):
                 email = payload.get("id_token_email") or payload.get("email")
                 tok = payload.get("token") if isinstance(payload.get("token"), dict) else payload
-                id_token = payload.get("id_token") or tok.get("id_token")
+                if not email and isinstance(tok, dict):
+                    email = tok.get("id_token_email") or tok.get("email")
+                id_token = payload.get("id_token") or (tok.get("id_token") if isinstance(tok, dict) else None)
                 if not email and id_token and "." in id_token:
                     parts = id_token.split(".")
                     if len(parts) > 1:
@@ -227,7 +229,22 @@ EOF
         [ -d "$p" ] || continue
         name="$(basename "$p")"
         [[ "$name" == .* ]] && continue
-        if is_profile_authenticated "$p"; then
+        local mail=""
+        for cf in "$p/.tokens/credential.txt" "$p/.tokens/token.json" "$p/antigravity-oauth-token"; do
+            if [ -f "$cf" ]; then
+                local raw=""
+                raw=$(cat "$cf" 2>/dev/null)
+                if [[ "$raw" == go-keyring-base64:* ]]; then
+                    raw=$(echo "${raw#go-keyring-base64:}" | base64 -d 2>/dev/null || true)
+                fi
+                mail=$(echo "$raw" | grep -o '"id_token_email"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"id_token_email"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)
+                [ -z "$mail" ] && mail=$(echo "$raw" | grep -o '"email"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"email"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)
+                [ -n "$mail" ] && break
+            fi
+        done
+        if [ -n "$mail" ]; then
+            echo "  • $name  ($mail)"
+        elif is_profile_authenticated "$p"; then
             echo "  • $name"
         else
             echo "  • $name  (not authenticated)"

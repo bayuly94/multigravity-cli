@@ -3,6 +3,7 @@
 mgy (multigravity) - Profile manager for Antigravity CLI (agy) on Windows
 Manages isolated credentials, sessions, and configurations per profile.
 #>
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 $Command = if ($args.Count -gt 0) { [string]$args[0] } else { $null }
 [string[]]$RemainingArgs = @($args | Select-Object -Skip 1)
 
@@ -338,6 +339,10 @@ function Get-ProfileTokenAccount([string]$TokenJson) {
         $obj = $clean | ConvertFrom-Json -ErrorAction SilentlyContinue
         if ($obj.id_token_email) { return $obj.id_token_email }
         if ($obj.email) { return $obj.email }
+        if ($obj.token) {
+            if ($obj.token.id_token_email) { return $obj.token.id_token_email }
+            if ($obj.token.email) { return $obj.token.email }
+        }
         $idToken = $obj.id_token
         if (-not $idToken -and $obj.token -and $obj.token.id_token) {
             $idToken = $obj.token.id_token
@@ -353,9 +358,6 @@ function Get-ProfileTokenAccount([string]$TokenJson) {
                 if ($claims.email) { return $claims.email }
                 if ($claims.sub) { return $claims.sub }
             }
-        }
-        if ($obj.token -and $obj.token.refresh_token) {
-            return $obj.token.refresh_token
         }
     } catch {}
     return $null
@@ -386,15 +388,16 @@ function Show-ProfilesList {
         $dirs = @(Get-ChildItem -Path $ProfilesDir -Directory | Where-Object { -not $_.Name.StartsWith(".") })
         if ($dirs.Count -gt 0) {
             $maxLen = ($dirs | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
+            $bullet = [char]0x2022
             foreach ($d in $dirs) {
                 $account = Get-ProfileAccount $d.FullName
                 $paddedName = $d.Name.PadRight($maxLen)
-                Write-Host "  • " -NoNewline
+                Write-Host "  $bullet " -NoNewline
                 Write-Host $paddedName -NoNewline -ForegroundColor White
                 if ($account) {
-                    Write-Host "  ($account)" -ForegroundColor DarkGray
+                    Write-Host "  ($account)" -ForegroundColor Gray
                 } else {
-                    Write-Host "  (not authenticated)" -ForegroundColor DarkYellow
+                    Write-Host "  (not authenticated)" -ForegroundColor Yellow
                 }
             }
         } else {
