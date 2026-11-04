@@ -54,8 +54,56 @@ usage() {
     exit 1
 }
 
+ORIG_DEFAULT_KC=""
+ORIG_USER_KCS=""
+
+activate_profile_keychain() {
+    local target="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        local kc="$target/Library/Keychains/login.keychain-db"
+        if [ -f "$kc" ]; then
+            if [ -z "$ORIG_DEFAULT_KC" ]; then
+                ORIG_DEFAULT_KC="$(security default-keychain 2>/dev/null | tr -d '\" ' | xargs)"
+                ORIG_USER_KCS="$(security list-keychains -d user 2>/dev/null | tr -d '\"' | xargs)"
+                if [[ "$ORIG_DEFAULT_KC" == *"multigravity-profiles"* ]] || [ ! -f "$ORIG_DEFAULT_KC" ]; then
+                    ORIG_DEFAULT_KC="$REAL_HOME/Library/Keychains/login.keychain-db"
+                fi
+                if [[ "$ORIG_USER_KCS" == *"multigravity-profiles"* ]] || [ -z "$ORIG_USER_KCS" ]; then
+                    ORIG_USER_KCS="$REAL_HOME/Library/Keychains/login.keychain-db"
+                fi
+            fi
+            security default-keychain -s "$kc" 2>/dev/null || true
+            security list-keychains -d user -s "$kc" 2>/dev/null || true
+            security unlock-keychain -p "" "$kc" 2>/dev/null || true
+        fi
+    fi
+}
+
+restore_profile_keychain() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        local host_kc="$REAL_HOME/Library/Keychains/login.keychain-db"
+        local target_def="${ORIG_DEFAULT_KC:-$host_kc}"
+        if [[ "$target_def" == *"multigravity-profiles"* ]] || [ ! -f "$target_def" ]; then
+            target_def="$host_kc"
+        fi
+        security default-keychain -s "$target_def" 2>/dev/null || true
+        local target_list="${ORIG_USER_KCS:-$host_kc}"
+        if [[ "$target_list" == *"multigravity-profiles"* ]]; then
+            target_list="$host_kc"
+        fi
+        security list-keychains -d user -s $target_list 2>/dev/null || true
+    fi
+}
+
+trap restore_profile_keychain EXIT INT TERM HUP
+
 setup_profile_environment() {
     local target="$1"
+
+    # Ensure no leftover global oauth token leaks into profiles from the shared antigravity-cli directory
+    if [ -f "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]; then
+        mv "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token.bak" 2>/dev/null || true
+    fi
 
     # Share global ~/.gemini/antigravity-cli (all conversations, history, settings, and MCP tools)
     mkdir -p "$target/.gemini"
@@ -85,10 +133,6 @@ setup_profile_environment() {
                 security unlock-keychain -p "" "$kc" 2>/dev/null || true
             fi
         fi
-        if [ -f "$kc" ]; then
-            HOME="$target" security default-keychain -s "$kc" 2>/dev/null || true
-            HOME="$target" security list-keychains -d user -s "$kc" 2>/dev/null || true
-        fi
     fi
 }
 
@@ -100,7 +144,7 @@ is_profile_authenticated() {
             security find-generic-password -s gemini -a antigravity "$kc" >/dev/null 2>&1
             return $?
         fi
-        HOME="$target" security find-generic-password -s gemini -a antigravity >/dev/null 2>&1
+        security find-generic-password -s gemini -a antigravity >/dev/null 2>&1
         return $?
     elif [ -f "$target/.tokens/credential.txt" ]; then
         return 0
@@ -510,10 +554,13 @@ case "$1" in
 
         mkdir -p "$TARGET_DIR/.gemini/antigravity-cli"
         setup_profile_environment "$TARGET_DIR"
+        activate_profile_keychain "$TARGET_DIR"
 
         echo "Setting up profile '$PROFILE_NAME'..."
         # Launch agy in interactive mode to authenticate without the 60s headless timeout
         USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy
+        status=$?
+        restore_profile_keychain
 
         if is_profile_authenticated "$TARGET_DIR"; then
             echo "Profile '$PROFILE_NAME' is ready!"
@@ -826,8 +873,12 @@ EOF
         fi
         TARGET_DIR="$PROFILES_DIR/$SELECTED_PROFILE"
         setup_profile_environment "$TARGET_DIR"
+        activate_profile_keychain "$TARGET_DIR"
         echo "Starting agy with profile '$SELECTED_PROFILE'..."
-        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" exec agy "$@"
+        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy "$@"
+        status=$?
+        restore_profile_keychain
+        exit $status
         ;;
 
     *)
@@ -837,7 +888,11 @@ EOF
             exit 1
         fi
         setup_profile_environment "$TARGET_DIR"
+        activate_profile_keychain "$TARGET_DIR"
         echo "Starting agy with profile '$1'..."
-        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" exec agy "${@:2}"
+        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy "${@:2}"
+        status=$?
+        restore_profile_keychain
+        exit $status
         ;;
 esac
