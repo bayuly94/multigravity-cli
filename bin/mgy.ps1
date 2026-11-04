@@ -878,7 +878,8 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
                     [System.IO.File]::WriteAllText($tokenFile, $savedCred, $utf8NoBom)
                     Write-Host "Profile '$profileName' is ready!" -ForegroundColor Green
                 } else {
-                    Write-Host "Warning: No credentials were saved for profile '$profileName'." -ForegroundColor Yellow
+                    Write-Host "Profile '$profileName' was created, but not yet authenticated." -ForegroundColor Yellow
+                    Write-Host "Run 'mgy $profileName' whenever you're ready to sign in." -ForegroundColor Cyan
                     if ($prevCred) {
                         [WinCredManager]::WriteCredential("gemini:antigravity", $prevCred) | Out-Null
                     }
