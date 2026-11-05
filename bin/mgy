@@ -76,10 +76,20 @@ activate_profile_keychain() {
             security list-keychains -d user -s "$kc" 2>/dev/null || true
             security unlock-keychain -p "" "$kc" 2>/dev/null || true
         fi
+    elif [[ "$OSTYPE" == "linux"* ]]; then
+        # On Linux, sync profile token file before launching agy
+        local token_file="$target/.tokens/credential.txt"
+        mkdir -p "$target/.tokens"
+        if [ -f "$token_file" ]; then
+            cp "$token_file" "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+        else
+            rm -f "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+        fi
     fi
 }
 
 restore_profile_keychain() {
+    local target="$1"
     if [[ "$OSTYPE" == "darwin"* ]]; then
         local host_kc="$REAL_HOME/Library/Keychains/login.keychain-db"
         local target_def="${ORIG_DEFAULT_KC:-$host_kc}"
@@ -92,6 +102,17 @@ restore_profile_keychain() {
             target_list="$host_kc"
         fi
         security list-keychains -d user -s $target_list 2>/dev/null || true
+    elif [[ "$OSTYPE" == "linux"* ]] && [ -n "$target" ] && [ -d "$target" ]; then
+        # On Linux, persist updated token to profile and clean shared directory
+        local token_file="$target/.tokens/credential.txt"
+        mkdir -p "$target/.tokens"
+        if [ -f "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]; then
+            cp "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" "$token_file" 2>/dev/null || true
+            rm -f "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+        elif [ -f "$target/antigravity-oauth-token" ]; then
+            cp "$target/antigravity-oauth-token" "$token_file" 2>/dev/null || true
+            rm -f "$target/antigravity-oauth-token" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -560,7 +581,7 @@ case "$1" in
         # Launch agy in interactive mode to authenticate without the 60s headless timeout
         USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy
         status=$?
-        restore_profile_keychain
+        restore_profile_keychain "$TARGET_DIR"
 
         if is_profile_authenticated "$TARGET_DIR"; then
             echo "Profile '$PROFILE_NAME' is ready!"
@@ -877,7 +898,7 @@ EOF
         echo "Starting agy with profile '$SELECTED_PROFILE'..."
         USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy "$@"
         status=$?
-        restore_profile_keychain
+        restore_profile_keychain "$TARGET_DIR"
         exit $status
         ;;
 
@@ -892,7 +913,7 @@ EOF
         echo "Starting agy with profile '$1'..."
         USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy "${@:2}"
         status=$?
-        restore_profile_keychain
+        restore_profile_keychain "$TARGET_DIR"
         exit $status
         ;;
 esac

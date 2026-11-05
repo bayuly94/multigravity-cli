@@ -1,0 +1,9 @@
+LICENSE
+README.md
+setup.py
+bin/mgy
+bin/mgy-quota
+multigravity_cli.egg-info/PKG-INFO
+multigravity_cli.egg-info/SOURCES.txt
+multigravity_cli.egg-info/dependency_links.txt
+multigravity_cli.egg-info/top_level.txt
