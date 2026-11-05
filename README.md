@@ -1,3 +1,7 @@
+<div align="center">
+
+<img src="assets/multigravity-cli-logo.jpeg" alt="multigravity-cli logo" width="320" style="border-radius: 16px; margin-bottom: 16px;">
+
 # mgy (multigravity-cli)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -5,6 +9,8 @@
 [![Shell](https://img.shields.io/badge/Shell-bash%20%7C%20zsh%20%7C%20powershell-orange.svg)]()
 
 > Lightweight multi-account profile, session, and quota manager for the **Google Antigravity CLI (`agy`)**.
+
+</div>
 
 `mgy` (short for `multigravity`) enables developers to maintain multiple isolated Antigravity accounts (e.g., personal, work, client, or shared team accounts) on a single machine. Just as `agy` is the CLI for Antigravity, `mgy` is your tool for managing multi-gravity profiles.
 
