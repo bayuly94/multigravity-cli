@@ -117,10 +117,12 @@ public class WinCredManager {
 }
 "@
 
-if (-not ([System.Management.Automation.PSTypeName]'WinCredManager').Type) {
-    try {
-        Add-Type -TypeDefinition $WinCredSource -ErrorAction SilentlyContinue
-    } catch {}
+function Ensure-WinCredManager {
+    if (-not ([System.Management.Automation.PSTypeName]'WinCredManager').Type) {
+        try {
+            Add-Type -TypeDefinition $WinCredSource -ErrorAction SilentlyContinue
+        } catch {}
+    }
 }
 
 function Show-Help {
@@ -417,6 +419,7 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
 
     Setup-ProfileEnvironment -TargetDir $targetDir
 
+    Ensure-WinCredManager
     $hasWinCred = ([System.Management.Automation.PSTypeName]'WinCredManager').Type -ne $null
     $tokensDir = Join-Path $targetDir ".tokens"
     $tokenFile = Join-Path $tokensDir "credential.txt"
@@ -856,6 +859,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
 
         Write-Host "Setting up profile '$profileName'..." -ForegroundColor Cyan
 
+        Ensure-WinCredManager
         $hasWinCred = ([System.Management.Automation.PSTypeName]'WinCredManager').Type -ne $null
         $prevCred = if ($hasWinCred) { [WinCredManager]::ReadCredential("gemini:antigravity") } else { $null }
         if ($hasWinCred) {
@@ -930,6 +934,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         New-Item -ItemType Directory -Path $tokensDir -Force | Out-Null
         Setup-ProfileEnvironment -TargetDir $targetDir
 
+        Ensure-WinCredManager
         $hasWinCred = ([System.Management.Automation.PSTypeName]'WinCredManager').Type -ne $null
         if ($hasWinCred) {
             $hostCred = [WinCredManager]::ReadCredential("gemini:antigravity")
