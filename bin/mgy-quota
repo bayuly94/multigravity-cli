@@ -49,6 +49,15 @@ RED = "\033[31m"
 
 _OAUTH_CLIENT_CACHE = None
 _CACHE_LOCK = None
+_SSL_CONTEXT = None
+
+def get_ssl_context():
+    """Returns a shared, pre-initialized SSL context to avoid reloading system CA bundles per request."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        import ssl
+        _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
 
 def find_agy_binary():
     """Finds the actual agy binary across platforms for credential extraction."""
@@ -128,7 +137,7 @@ def get_agy_oauth_client(refresh_token=None):
                                     "refresh_token": refresh_token
                                 }).encode()
                                 req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-                                with urllib.request.urlopen(req, timeout=5) as resp:
+                                with urllib.request.urlopen(req, context=get_ssl_context(), timeout=5) as resp:
                                     t = json.loads(resp.read().decode())
                                     if "access_token" in t:
                                         found_c, found_s = c, s
@@ -390,7 +399,7 @@ def fetch_single_profile(name, profile_path):
                     "refresh_token": refresh_token
                 }).encode()
                 req = urllib.request.Request("https://oauth2.googleapis.com/token", data=refresh_data)
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, context=get_ssl_context(), timeout=10) as resp:
                     t_data = json.loads(resp.read().decode())
                 new_token = t_data.get("access_token")
                 if new_token:
@@ -444,7 +453,7 @@ def fetch_single_profile(name, profile_path):
                 data=json.dumps({"metadata": {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}}).encode(),
                 headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
             )
-            with urllib.request.urlopen(req1, timeout=10) as resp:
+            with urllib.request.urlopen(req1, context=get_ssl_context(), timeout=10) as resp:
                 res1 = json.loads(resp.read().decode())
             
             tier = (res1.get("paidTier") or {}).get("id") or (res1.get("currentTier") or {}).get("id") or "STANDARD"
@@ -470,7 +479,7 @@ def fetch_single_profile(name, profile_path):
             data=json.dumps({"project": proj_id}).encode(),
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
         )
-        with urllib.request.urlopen(req2, timeout=10) as resp:
+        with urllib.request.urlopen(req2, context=get_ssl_context(), timeout=10) as resp:
             res2 = json.loads(resp.read().decode())
     except Exception as e:
         result["error"] = f"API error: {e}"
@@ -733,9 +742,8 @@ def run_dashboard(selected_profile=None, forced_cols=None):
         print("No profiles found.")
         return
 
-    # Fetch data in parallel (scale concurrency with CPU cores: up to 16 on desktop/Mac, min 4)
-    cpu_cores = os.cpu_count() or 4
-    workers = min(len(targets), max(4, min(cpu_cores * 2, 16)))
+    # Fetch data in parallel across all profiles (network I/O releases GIL; up to 24 concurrent workers)
+    workers = min(len(targets), 24)
     results = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(fetch_single_profile, name, path): name for name, path in targets}
