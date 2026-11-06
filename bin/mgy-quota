@@ -48,6 +48,7 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 
 _OAUTH_CLIENT_CACHE = None
+_CACHE_LOCK = None
 
 def find_agy_binary():
     """Finds the actual agy binary across platforms for credential extraction."""
@@ -74,8 +75,12 @@ def find_agy_binary():
     return None
 
 def get_agy_oauth_client(refresh_token=None):
-    """Dynamically extracts Google Antigravity's public OAuth client credentials from the local agy binary."""
-    global _OAUTH_CLIENT_CACHE
+    """Retrieves Google Antigravity's public OAuth client credentials safely using cache & singleton lock."""
+    global _OAUTH_CLIENT_CACHE, _CACHE_LOCK
+    if _CACHE_LOCK is None:
+        import threading
+        _CACHE_LOCK = threading.Lock()
+
     if _OAUTH_CLIENT_CACHE:
         return _OAUTH_CLIENT_CACHE
 
@@ -85,37 +90,67 @@ def get_agy_oauth_client(refresh_token=None):
         _OAUTH_CLIENT_CACHE = (cid, sec)
         return _OAUTH_CLIENT_CACHE
 
-    agy_path = find_agy_binary()
-    if agy_path and os.path.exists(agy_path):
+    # Check persisted local cache file
+    cache_file = os.path.join(get_real_home(), ".config", "multigravity-profiles", ".oauth_client.json")
+    if os.path.exists(cache_file):
         try:
-            with open(agy_path, "rb") as f:
-                content = f.read()
-            cids = list(dict.fromkeys(c.decode() for c in re.findall(rb"[0-9]+-[a-z0-9_]+\.apps\.googleusercontent\.com", content)))
-            secs = list(dict.fromkeys(s.decode() for s in re.findall(rb"GOCSPX-[A-Za-z0-9_-]{28}", content)))
-            
-            if refresh_token:
-                for c in cids:
-                    for s in secs:
-                        try:
-                            data = urllib.parse.urlencode({
-                                "client_id": c,
-                                "client_secret": s,
-                                "grant_type": "refresh_token",
-                                "refresh_token": refresh_token
-                            }).encode()
-                            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-                            with urllib.request.urlopen(req, timeout=5) as resp:
-                                t = json.loads(resp.read().decode())
-                                if "access_token" in t:
-                                    _OAUTH_CLIENT_CACHE = (c, s)
-                                    return _OAUTH_CLIENT_CACHE
-                        except Exception:
-                            continue
-            elif cids and secs:
-                _OAUTH_CLIENT_CACHE = (cids[0], secs[0])
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            c = data.get("client_id")
+            s = data.get("client_secret")
+            if c and s:
+                _OAUTH_CLIENT_CACHE = (c, s)
                 return _OAUTH_CLIENT_CACHE
         except Exception:
             pass
+
+    with _CACHE_LOCK:
+        if _OAUTH_CLIENT_CACHE:
+            return _OAUTH_CLIENT_CACHE
+
+        agy_path = find_agy_binary()
+        if agy_path and os.path.exists(agy_path):
+            try:
+                with open(agy_path, "rb") as f:
+                    content = f.read()
+                cids = list(dict.fromkeys(c.decode() for c in re.findall(rb"[0-9]+-[a-z0-9_]+\.apps\.googleusercontent\.com", content)))
+                secs = list(dict.fromkeys(s.decode() for s in re.findall(rb"GOCSPX-[A-Za-z0-9_-]{28}", content)))
+
+                found_c, found_s = None, None
+                if refresh_token:
+                    for c in cids:
+                        for s in secs:
+                            try:
+                                data = urllib.parse.urlencode({
+                                    "client_id": c,
+                                    "client_secret": s,
+                                    "grant_type": "refresh_token",
+                                    "refresh_token": refresh_token
+                                }).encode()
+                                req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+                                with urllib.request.urlopen(req, timeout=5) as resp:
+                                    t = json.loads(resp.read().decode())
+                                    if "access_token" in t:
+                                        found_c, found_s = c, s
+                                        break
+                            except Exception:
+                                continue
+                        if found_c:
+                            break
+                elif cids and secs:
+                    found_c, found_s = cids[0], secs[0]
+
+                if found_c and found_s:
+                    _OAUTH_CLIENT_CACHE = (found_c, found_s)
+                    try:
+                        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump({"client_id": found_c, "client_secret": found_s}, f)
+                    except Exception:
+                        pass
+                    return _OAUTH_CLIENT_CACHE
+            except Exception:
+                pass
 
     return None, None
 
@@ -352,6 +387,22 @@ def fetch_single_profile(name, profile_path):
                 new_token = t_data.get("access_token")
                 if new_token:
                     access_token = new_token
+                    # Persist refreshed token to profile token file if available
+                    token_file = os.path.join(profile_path, ".tokens", "credential.txt")
+                    if os.path.exists(token_file):
+                        try:
+                            expires_in = t_data.get("expires_in", 3600)
+                            tok["access_token"] = new_token
+                            tok["expiry"] = datetime.fromtimestamp(time.time() + expires_in, timezone.utc).isoformat()
+                            if isinstance(payload, dict) and "token" in payload:
+                                payload["token"] = tok
+                                save_payload = payload
+                            else:
+                                save_payload = tok
+                            with open(token_file, "w", encoding="utf-8") as tf:
+                                json.dump(save_payload, tf, indent=2)
+                        except Exception:
+                            pass
             except Exception as e:
                 if not access_token:
                     result["error"] = f"OAuth refresh error: {e}"
@@ -654,9 +705,9 @@ def run_dashboard(selected_profile=None, forced_cols=None):
         print("No profiles found.")
         return
 
-    # Fetch data in parallel
+    # Fetch data in parallel (limit concurrency to 4 workers to prevent overloading CPU/network on small devices)
     results = []
-    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+    with ThreadPoolExecutor(max_workers=min(len(targets), 4)) as ex:
         futs = {ex.submit(fetch_single_profile, name, path): name for name, path in targets}
         for fut in as_completed(futs):
             results.append(fut.result())
