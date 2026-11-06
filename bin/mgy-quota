@@ -268,6 +268,14 @@ def get_profile_raw_credential(name, profile_path):
                     cmd = ["security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w", kc]
                     raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
                     if raw:
+                        # Cache to profile token file so subsequent calls skip macOS security CLI
+                        try:
+                            token_file = os.path.join(profile_path, ".tokens", "credential.txt")
+                            os.makedirs(os.path.dirname(token_file), exist_ok=True)
+                            with open(token_file, "w", encoding="utf-8") as tf:
+                                tf.write(raw)
+                        except Exception:
+                            pass
                         return raw
             except Exception:
                 pass
@@ -414,26 +422,46 @@ def fetch_single_profile(name, profile_path):
 
     result["authenticated"] = True
 
-    # 2. Call loadCodeAssist
+    # 2. Tier resolution (cached for 24h to avoid extra HTTP roundtrip per profile)
     proj_id = "aicode-consumers"
-    try:
-        req1 = urllib.request.Request(
-            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-            data=json.dumps({"metadata": {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}}).encode(),
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
-        )
-        with urllib.request.urlopen(req1, timeout=10) as resp:
-            res1 = json.loads(resp.read().decode())
-        
-        tier = (res1.get("paidTier") or {}).get("id") or (res1.get("currentTier") or {}).get("id") or "STANDARD"
-        result["tier"] = get_tier_label(tier)
-        proj = res1.get("cloudaicompanionProject")
-        if isinstance(proj, dict):
-            proj_id = proj.get("id") or proj_id
-        elif isinstance(proj, str) and proj:
-            proj_id = proj
-    except Exception:
-        result["tier"] = "PRO"
+    tier_cache_file = os.path.join(profile_path, ".tokens", "tier_cache.json")
+    tier_cached = None
+    if os.path.exists(tier_cache_file):
+        try:
+            with open(tier_cache_file, "r", encoding="utf-8") as tf:
+                tdata = json.load(tf)
+            if time.time() - tdata.get("time", 0) < 86400:
+                tier_cached = tdata.get("tier")
+                result["tier"] = tier_cached
+                proj_id = tdata.get("proj_id") or proj_id
+        except Exception:
+            pass
+
+    if not tier_cached:
+        try:
+            req1 = urllib.request.Request(
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                data=json.dumps({"metadata": {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}}).encode(),
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": "antigravity"}
+            )
+            with urllib.request.urlopen(req1, timeout=10) as resp:
+                res1 = json.loads(resp.read().decode())
+            
+            tier = (res1.get("paidTier") or {}).get("id") or (res1.get("currentTier") or {}).get("id") or "STANDARD"
+            result["tier"] = get_tier_label(tier)
+            proj = res1.get("cloudaicompanionProject")
+            if isinstance(proj, dict):
+                proj_id = proj.get("id") or proj_id
+            elif isinstance(proj, str) and proj:
+                proj_id = proj
+            try:
+                os.makedirs(os.path.dirname(tier_cache_file), exist_ok=True)
+                with open(tier_cache_file, "w", encoding="utf-8") as tf:
+                    json.dump({"tier": result["tier"], "proj_id": proj_id, "time": time.time()}, tf)
+            except Exception:
+                pass
+        except Exception:
+            result["tier"] = "PRO"
 
     # 3. Call fetchAvailableModels
     try:
@@ -705,9 +733,11 @@ def run_dashboard(selected_profile=None, forced_cols=None):
         print("No profiles found.")
         return
 
-    # Fetch data in parallel (limit concurrency to 4 workers to prevent overloading CPU/network on small devices)
+    # Fetch data in parallel (scale concurrency with CPU cores: up to 16 on desktop/Mac, min 4)
+    cpu_cores = os.cpu_count() or 4
+    workers = min(len(targets), max(4, min(cpu_cores * 2, 16)))
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(targets), 4)) as ex:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(fetch_single_profile, name, path): name for name, path in targets}
         for fut in as_completed(futs):
             results.append(fut.result())
