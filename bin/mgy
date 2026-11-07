@@ -18,6 +18,8 @@ print_help() {
 Usage: $CMD_NAME [command] [options]
 
 Commands:
+  best, auto [agy args]  Start agy using the profile with the highest remaining quota
+  resume [id] [agy args] Rebind trajectory_meta and resume conversation on best profile
   new <profile>          Create a new isolated profile and authenticate
   import <profile|tar.gz> Import host session into profile OR import conversation archive
   list                   List all existing profiles
@@ -31,10 +33,16 @@ Commands:
   <profile> [agy args]   Start agy session using the specified profile
 
 Resume & Conversation Flags (same as agy):
-  $CMD_NAME <profile> --conversation=<id>   Resume a specific conversation by ID
-  $CMD_NAME <profile> -c, --continue       Continue the most recent conversation
+  $CMD_NAME best                            Start session on profile with highest quota
+  $CMD_NAME best -c                         Continue latest conversation on best profile
+  $CMD_NAME resume [conv_id]                Resume latest (or specified) conversation on best profile
+  $CMD_NAME <profile> --conversation=<id>   Resume a specific conversation by ID (auto-rebinds trajectory)
+  $CMD_NAME <profile> -c, --continue        Continue the most recent conversation (auto-rebinds trajectory)
 
 Examples:
+  $CMD_NAME best                          # Auto-select profile with most quota and start agy
+  $CMD_NAME best -c                       # Continue latest chat on profile with most quota
+  $CMD_NAME resume <id>                   # Rebind SQLite trajectory and resume chat on best profile
   $CMD_NAME new <profile>                 # Set up a new profile with Google login
   $CMD_NAME list                          # List all registered profiles
   $CMD_NAME fork --conversation=<id>      # Fork conversation across all profiles
@@ -556,6 +564,186 @@ EOF
         echo "  agy --conversation $imported_id"
     fi
 }
+
+resolve_quota_bin() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -x "$script_dir/mgy-quota" ]; then
+        echo "$script_dir/mgy-quota"
+    elif command -v mgy-quota >/dev/null 2>&1; then
+        command -v mgy-quota
+    elif [ -f "$script_dir/mgy-quota" ]; then
+        echo "$script_dir/mgy-quota"
+    fi
+}
+
+get_model_hint_from_args() {
+    local prev=""
+    for arg in "$@"; do
+        if [ "$prev" = "--model" ]; then
+            echo "$arg"
+            return 0
+        fi
+        case "$arg" in
+            --model=*)
+                echo "${arg#--model=}"
+                return 0
+                ;;
+            --model)
+                prev="--model"
+                ;;
+        esac
+    done
+}
+
+select_best_profile() {
+    local exclude="$1"
+    local model_hint="$2"
+    local qbin
+    qbin="$(resolve_quota_bin)"
+    [ -z "$qbin" ] && return 1
+    local args=("--best" "--best-format" "detail")
+    [ -n "$exclude" ] && args+=("--exclude" "$exclude")
+    [ -n "$model_hint" ] && args+=("--model" "$model_hint")
+    "$qbin" "${args[@]}" 2>/dev/null
+}
+
+start_profile_session() {
+    local current_profile="$1"
+    shift
+    local current_args=("$@")
+    local no_failover="${MGY_NO_FAILOVER:-0}"
+    if [ "${MULTIGRAVITY_AUTO_FAILOVER:-1}" = "0" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-1}" = "false" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-1}" = "FALSE" ]; then
+        no_failover="1"
+    fi
+    local filtered_init=()
+    for a in "${current_args[@]}"; do
+        if [ "$a" = "--no-failover" ]; then
+            no_failover="1"
+        else
+            case "$a" in
+                --version|-v|--help|-h) no_failover="1" ;;
+            esac
+            filtered_init+=("$a")
+        fi
+    done
+    current_args=("${filtered_init[@]}")
+
+    local tried_profiles="$current_profile"
+    local qbin
+    qbin="$(resolve_quota_bin)"
+
+    while true; do
+        local target_dir="$PROFILES_DIR/$current_profile"
+        if [ ! -d "$target_dir" ]; then
+            echo "Error: profile '$current_profile' does not exist. Create it first using: $CMD_NAME new $current_profile"
+            exit 1
+        fi
+
+        setup_profile_environment "$target_dir"
+
+        # Detect and rebind SQLite trajectory_meta if resuming an existing conversation (--conversation or -c)
+        local active_conv_id=""
+        local needs_latest=0
+        local prev=""
+        for a in "${current_args[@]}"; do
+            if [ "$prev" = "--conversation" ]; then
+                active_conv_id="$a"
+                prev=""
+                continue
+            fi
+            case "$a" in
+                --conversation=*) active_conv_id="${a#--conversation=}" ;;
+                --conversation) prev="--conversation" ;;
+                -c|--continue) needs_latest=1 ;;
+            esac
+        done
+
+        if [ -n "$qbin" ]; then
+            if [ -n "$active_conv_id" ]; then
+                "$qbin" --rebind "$active_conv_id" >/dev/null 2>&1 || true
+            elif [ "$needs_latest" -eq 1 ]; then
+                local resolved_id
+                resolved_id="$("$qbin" --rebind latest 2>/dev/null || true)"
+                if [ -n "$resolved_id" ]; then
+                    active_conv_id="$resolved_id"
+                    local rewritten=()
+                    local replaced=0
+                    for a in "${current_args[@]}"; do
+                        if [ "$replaced" -eq 0 ] && { [ "$a" = "-c" ] || [ "$a" = "--continue" ]; }; then
+                            rewritten+=("--conversation" "$active_conv_id")
+                            replaced=1
+                        else
+                            rewritten+=("$a")
+                        fi
+                    done
+                    current_args=("${rewritten[@]}")
+                fi
+            fi
+        fi
+
+        local session_start_epoch
+        session_start_epoch="$(date +%s)"
+
+        activate_profile_keychain "$target_dir"
+        echo "Starting agy with profile '$current_profile'..."
+        USERPROFILE="$target_dir" HOME="$target_dir" agy "${current_args[@]}"
+        local status=$?
+        restore_profile_keychain "$target_dir"
+
+        if [ "$no_failover" != "1" ] && [ -n "$qbin" ]; then
+            if [ -z "$active_conv_id" ]; then
+                local found_conv
+                found_conv="$("$qbin" --find-active-conv --since "$session_start_epoch" 2>/dev/null || true)"
+                [ -n "$found_conv" ] && active_conv_id="$found_conv"
+            fi
+
+            if [ -n "$active_conv_id" ]; then
+                local model_hint
+                model_hint="$(get_model_hint_from_args "${current_args[@]}")"
+                local chk_args=("--check-exhausted" "$current_profile" "--conv-id" "$active_conv_id")
+                [ -n "$model_hint" ] && chk_args+=("--model" "$model_hint")
+                local check_out
+                if check_out="$("$qbin" "${chk_args[@]}" 2>/dev/null)" && [[ "$check_out" == EXHAUSTED\|* ]]; then
+                    local ex_pct ex_prov
+                    IFS='|' read -r _ ex_pct ex_prov _ <<< "$check_out"
+                    echo ""
+                    echo "[!] Quota reached on profile '$current_profile' ($ex_prov: ${ex_pct}% remaining)."
+                    local next_detail
+                    if next_detail="$(select_best_profile "$tried_profiles" "$model_hint")" && [ -n "$next_detail" ]; then
+                        local next_prof next_tier next_pct _ next_prov
+                        IFS='|' read -r next_prof next_tier next_pct _ next_prov <<< "$next_detail"
+                        echo "==> Switching to profile '$next_prof' [$next_tier] ($next_prov: ${next_pct}% available) and resuming conversation '$active_conv_id'..."
+                        current_profile="$next_prof"
+                        tried_profiles="${tried_profiles},${current_profile}"
+
+                        local failover_args=("--conversation" "$active_conv_id")
+                        local skip_next=0
+                        for a in "${current_args[@]}"; do
+                            if [ "$skip_next" -eq 1 ]; then
+                                skip_next=0
+                                continue
+                            fi
+                            case "$a" in
+                                --conversation=*) ;;
+                                --conversation) skip_next=1 ;;
+                                -c|--continue) ;;
+                                *) failover_args+=("$a") ;;
+                            esac
+                        done
+                        current_args=("${failover_args[@]}")
+                        continue
+                    else
+                        echo "[!] No other authenticated profiles have remaining quota for $ex_prov."
+                    fi
+                fi
+            fi
+        fi
+
+        return $status
+    done
+}
+
 case "$1" in
     new)
         shift
@@ -874,6 +1062,57 @@ EOF
         fi
         ;;
 
+    best|auto)
+        shift
+        model_hint=$(get_model_hint_from_args "$@")
+        best_detail=$(select_best_profile "" "$model_hint")
+        if [ -z "$best_detail" ]; then
+            echo "Error: Could not find any authenticated profile with remaining quota. Run '$CMD_NAME quotas' to inspect." >&2
+            exit 1
+        fi
+        IFS='|' read -r best_profile best_tier best_pct _ best_prov <<< "$best_detail"
+        echo "==> Selected best profile: '$best_profile' [$best_tier] ($best_prov: ${best_pct}% quota available)"
+        start_profile_session "$best_profile" "$@"
+        exit $?
+        ;;
+
+    resume)
+        shift
+        target_prof=""
+        declare -a resume_args=()
+        if [ $# -eq 0 ]; then
+            resume_args=("-c")
+        elif [ -d "$PROFILES_DIR/$1" ] && [[ "$1" != -* ]]; then
+            target_prof="$1"
+            shift
+            if [ $# -eq 0 ]; then
+                resume_args=("-c")
+            elif [[ "$1" != -* ]]; then
+                resume_args=("--conversation" "$1" "${@:2}")
+            else
+                resume_args=("$@")
+            fi
+        elif [[ "$1" != -* ]]; then
+            resume_args=("--conversation" "$1" "${@:2}")
+        else
+            resume_args=("$@")
+        fi
+
+        if [ -z "$target_prof" ]; then
+            model_hint=$(get_model_hint_from_args "${resume_args[@]}")
+            best_detail=$(select_best_profile "" "$model_hint")
+            if [ -z "$best_detail" ]; then
+                echo "Error: Could not find any authenticated profile with remaining quota. Run '$CMD_NAME quotas' to inspect." >&2
+                exit 1
+            fi
+            IFS='|' read -r target_prof best_tier best_pct _ best_prov <<< "$best_detail"
+            echo "==> Selected best profile: '$target_prof' [$best_tier] ($best_prov: ${best_pct}% quota available)"
+        fi
+
+        start_profile_session "$target_prof" "${resume_args[@]}"
+        exit $?
+        ;;
+
     -*)
         # Flags passed without an explicit profile name (e.g. mgy --conversation=<id>, mgy -c)
         if [ -n "$MULTIGRAVITY_DEFAULT_PROFILE" ] && [ -d "$PROFILES_DIR/$MULTIGRAVITY_DEFAULT_PROFILE" ]; then
@@ -886,20 +1125,21 @@ EOF
                 echo "Error: No profiles found. Create one first using: $CMD_NAME new <profile_name>"
                 exit 1
             else
-                echo "Multiple profiles found. Please specify which profile to run: $CMD_NAME <profile> $*"
-                echo "Available profiles:"
-                list_profiles "$PROFILES_DIR"
-                exit 1
+                model_hint=$(get_model_hint_from_args "$@")
+                best_detail=$(select_best_profile "" "$model_hint")
+                if [ -n "$best_detail" ]; then
+                    IFS='|' read -r SELECTED_PROFILE best_tier best_pct _ best_prov <<< "$best_detail"
+                    echo "==> Selected best profile: '$SELECTED_PROFILE' [$best_tier] ($best_prov: ${best_pct}% quota available)"
+                else
+                    echo "Multiple profiles found. Please specify which profile to run: $CMD_NAME <profile> $*"
+                    echo "Available profiles:"
+                    list_profiles "$PROFILES_DIR"
+                    exit 1
+                fi
             fi
         fi
-        TARGET_DIR="$PROFILES_DIR/$SELECTED_PROFILE"
-        setup_profile_environment "$TARGET_DIR"
-        activate_profile_keychain "$TARGET_DIR"
-        echo "Starting agy with profile '$SELECTED_PROFILE'..."
-        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy "$@"
-        status=$?
-        restore_profile_keychain "$TARGET_DIR"
-        exit $status
+        start_profile_session "$SELECTED_PROFILE" "$@"
+        exit $?
         ;;
 
     *)
@@ -908,12 +1148,7 @@ EOF
             echo "Error: profile '$1' does not exist. Create it first using: $CMD_NAME new $1"
             exit 1
         fi
-        setup_profile_environment "$TARGET_DIR"
-        activate_profile_keychain "$TARGET_DIR"
-        echo "Starting agy with profile '$1'..."
-        USERPROFILE="$TARGET_DIR" HOME="$TARGET_DIR" agy "${@:2}"
-        status=$?
-        restore_profile_keychain "$TARGET_DIR"
-        exit $status
+        start_profile_session "$1" "${@:2}"
+        exit $?
         ;;
 esac

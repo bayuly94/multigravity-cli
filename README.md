@@ -126,20 +126,34 @@ Launch interactive sessions under separate profiles in separate terminal tabs, w
 
 Both instances execute simultaneously with full token and quota isolation while sharing all history and settings.
 
-#### Resuming Conversations Across Profiles
-Because conversations and history are shared globally, you can resume any conversation under any account:
+#### Smart Profile Selection (`mgy best`) & Cross-Profile Resume (`mgy resume`)
+`mgy` can automatically inspect quotas across all profiles and launch `agy` using the account with the highest remaining quota for your active model/provider:
+
+```bash
+# Automatically pick the profile with the highest remaining quota and start agy:
+mgy best
+mgy auto --model claude-sonnet-4-6
+
+# Rebind trajectory metadata and resume the latest (or specific) conversation on the best available profile:
+mgy resume
+mgy resume <conversation_id>
+```
+
+#### Resuming Conversations Across Profiles & Automatic Failover
+Because conversations and history are shared globally, you can resume any conversation under any account. `mgy` automatically rebinds `trajectory_meta` in SQLite when resuming (`--conversation` or `-c`) so switching accounts never causes trajectory ownership collisions, and automatically fails over to the next profile with available quota if your active profile hits `0%` quota when a session ends:
 
 ```bash
 # View recent conversation IDs:
 mgy conversations
 
-# Resume a specific conversation by ID:
+# Resume a specific conversation by ID (auto-rebinds trajectory metadata):
 mgy <profile_1> --conversation=<conversation_id>
 
 # Resume that SAME conversation under another profile to use a different quota:
 mgy <profile_2> --conversation=<conversation_id>
 
-# Continue the most recent conversation:
+# Continue the most recent conversation on the best available profile:
+mgy -c
 mgy <profile_1> -c
 mgy <profile_2> --continue
 ```
@@ -225,29 +239,31 @@ Both `mgy` and `multigravity` can be used interchangeably:
 
 | Command                             | Description                                                                                                                      |
 | :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
-| `mgy <profile> --conversation=<id>` | Resumes a specific conversation by ID (same as `agy --conversation=<id>`).                                                       |
-| `mgy <profile> -c`, `--continue`    | Continues the most recent conversation.                                                                                          |
+| `mgy best [args...]`, `mgy auto`    | Automatically selects the profile with the highest remaining quota for your active model and starts `agy`.                       |
+| `mgy resume [conv_id] [args...]`    | Rebinds `trajectory_meta` in SQLite and resumes the conversation on the profile with the highest remaining quota.                |
+| `mgy <profile> --conversation=<id>` | Rebinds `trajectory_meta` and resumes a specific conversation by ID (same as `agy --conversation=<id>`).                         |
+| `mgy <profile> -c`, `--continue`    | Continues the most recent conversation (auto-rebinding `trajectory_meta`).                                                       |
 | `mgy conversations`                 | Lists recent conversation IDs, titles, and activity timestamps.                                                                  |
 | `mgy export <id> [tar_path]`        | Exports a conversation, session SQLite DB, trajectory, and artifacts to a portable `.tar.gz` archive.                             |
 | `mgy import <profile|tar_path>`     | Imports a conversation archive (`.tar.gz` / `.zip`) into `~/.gemini/antigravity-cli` OR imports the host session into a profile.   |
 | `mgy import-conversation <tar_path>`| Alias for importing an exported conversation archive.                                                                            |
 | `mgy fork --conversation=<id>`      | Forks an active conversation across all other profiles with fresh IDs.                                                           |
 | `mgy new <profile>`                 | Creates a profile directory and executes the initial OAuth authentication flow.                                                  |
-
 | `mgy list`                          | Lists all available configured profiles.                                                                                         |
 | `mgy quotas`                        | Iterates across all profiles and outputs active model quotas.                                                                    |
 | `mgy delete <profile>`              | Prompts for confirmation and deletes the profile directory.                                                                      |
-| `mgy <profile> [args...]`           | Starts `agy` with the chosen profile, forwarding any arguments.                                                                  |
+| `mgy <profile> [args...]`           | Starts `agy` with the chosen profile, forwarding any arguments (with automatic quota-exhaustion failover on exit).               |
 | `mgy help`, `--help`, `-h`          | Displays the help and usage menu.                                                                                                |
 
 ---
 
 ## ⚙️ Configuration & Environment Variables
 
-| Variable                    | Default                           | Purpose                                                                      |
-| :-------------------------- | :-------------------------------- | :--------------------------------------------------------------------------- |
-| `MULTIGRAVITY_PROFILES_DIR` | `~/.config/multigravity-profiles` | Base directory where all isolated profile workspaces are stored.             |
-| `REAL_HOME`                 | `$HOME`                           | Host home directory used for resolving global `.gitconfig` and `.ssh` links. |
+| Variable                     | Default                           | Purpose                                                                           |
+| :--------------------------- | :-------------------------------- | :-------------------------------------------------------------------------------- |
+| `MULTIGRAVITY_PROFILES_DIR`  | `~/.config/multigravity-profiles` | Base directory where all isolated profile workspaces are stored.                  |
+| `MULTIGRAVITY_AUTO_FAILOVER` | `1` (enabled)                     | Set to `0` or `false` to disable automatic cross-profile failover on quota limit. |
+| `REAL_HOME`                  | `$HOME`                           | Host home directory used for resolving global `.gitconfig` and `.ssh` links.      |
 
 You can override the profiles storage directory by exporting `MULTIGRAVITY_PROFILES_DIR`:
 ```bash

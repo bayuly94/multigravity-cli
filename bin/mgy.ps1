@@ -130,6 +130,8 @@ function Show-Help {
 Usage: mgy [command] [options]
 
 Commands:
+  best, auto [agy args]  Start agy using the profile with the highest remaining quota
+  resume [id] [agy args] Rebind trajectory_meta and resume conversation on best profile
   new <profile>          Create a new isolated profile and authenticate
   import <profile|tar.gz> Import host session into profile OR import conversation archive
   list                   List all existing profiles
@@ -143,10 +145,16 @@ Commands:
   <profile> [agy args]   Start agy session using the specified profile
 
 Resume & Conversation Flags (same as agy):
-  mgy <profile> --conversation=<id>   Resume a specific conversation by ID
-  mgy <profile> -c, --continue        Continue the most recent conversation
+  mgy best                            Start session on profile with highest quota
+  mgy best -c                         Continue latest conversation on best profile
+  mgy resume [conv_id]                Resume latest (or specified) conversation on best profile
+  mgy <profile> --conversation=<id>   Resume a specific conversation by ID (auto-rebinds trajectory)
+  mgy <profile> -c, --continue        Continue the most recent conversation (auto-rebinds trajectory)
 
 Examples:
+  mgy best                     # Auto-select profile with most quota and start agy
+  mgy best -c                  # Continue latest chat on profile with most quota
+  mgy resume <id>              # Rebind SQLite trajectory and resume chat on best profile
   mgy new work                 # Set up a new profile with Google login
   mgy list                     # List all registered profiles
   mgy fork --conversation=<id> # Fork conversation across all profiles
@@ -410,115 +418,305 @@ function Show-ProfilesList {
     }
 }
 
-function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
-    $targetDir = Join-Path $ProfilesDir $ProfileName
-    if (-not (Test-Path $targetDir)) {
-        Write-Error "Error: profile '$ProfileName' does not exist. Create it first using: mgy new $ProfileName"
-        exit 1
+function Get-QuotaScriptPath {
+    $scriptDir = Split-Path -Parent $script:MyInvocation.MyCommand.Path
+    $candidates = @(
+        (Join-Path $scriptDir "mgy-quota"),
+        (Join-Path $scriptDir "mgy-quota.py")
+    )
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) { return $cand }
     }
+    foreach ($cmdName in @("mgy-quota", "mgy-quota.py")) {
+        $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+            return $cmd.Source
+        }
+    }
+    return $null
+}
 
-    Setup-ProfileEnvironment -TargetDir $targetDir
+function Get-ModelHintFromArgs([string[]]$AgyArgs) {
+    if (-not $AgyArgs) { return "" }
+    for ($i = 0; $i -lt $AgyArgs.Count; $i++) {
+        if ($AgyArgs[$i] -match "^--model=(.+)$") {
+            return $matches[1]
+        } elseif ($AgyArgs[$i] -eq "--model" -and ($i + 1) -lt $AgyArgs.Count) {
+            return $AgyArgs[$i + 1]
+        }
+    }
+    return ""
+}
 
-    Ensure-WinCredManager
-    $hasWinCred = ([System.Management.Automation.PSTypeName]'WinCredManager').Type -ne $null
-    $tokensDir = Join-Path $targetDir ".tokens"
-    $tokenFile = Join-Path $tokensDir "credential.txt"
-    $bootLockFile = Join-Path $ProfilesDir ".wincred_boot.lock"
-
-    # Startup synchronization: Ensure only one agy instance reads WinCred at a time
-    if ($hasWinCred) {
-        $waitRetries = 0
-        while ($true) {
-            try {
-                $lockStream = [System.IO.File]::Open($bootLockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-                $lockBytes = [System.Text.Encoding]::UTF8.GetBytes("$PID - $ProfileName")
-                $lockStream.Write($lockBytes, 0, $lockBytes.Length)
-                $lockStream.Close()
-                break
-            } catch [System.IO.IOException] {
-                if (Test-Path $bootLockFile) {
-                    $age = (Get-Date) - (Get-Item $bootLockFile).LastWriteTime
-                    if ($age.TotalSeconds -gt 8) {
-                        Remove-Item $bootLockFile -Force -ErrorAction SilentlyContinue
-                        continue
-                    }
-                }
-                Write-Host "[*] Multigravity: Waiting for worker initialization slot ($ProfileName)..." -ForegroundColor DarkGray
-                Start-Sleep -Milliseconds 600
-                $waitRetries++
-                if ($waitRetries -gt 35) {
-                    Remove-Item $bootLockFile -Force -ErrorAction SilentlyContinue
-                    break
-                }
-            } catch {
-                break
+function Select-BestProfile([string]$Exclude = "", [string]$ModelHint = "") {
+    $quotaScript = Get-QuotaScriptPath
+    if (-not $quotaScript) { return $null }
+    $qArgs = @("--best", "--best-format", "detail")
+    if ($Exclude) { $qArgs += @("--exclude", $Exclude) }
+    if ($ModelHint) { $qArgs += @("--model", $ModelHint) }
+    try {
+        $out = (& python $quotaScript @qArgs 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $out -and $out.Contains("|")) {
+            $parts = $out.Split("|")
+            return @{
+                Profile    = $parts[0]
+                Tier       = $parts[1]
+                TargetPct  = $parts[2]
+                OverallPct = $parts[3]
+                Provider   = $parts[4]
             }
         }
+    } catch {}
+    return $null
+}
 
-        # Background cleaner to release boot lock after agy reads the credential into memory (4 seconds)
-        try {
-            $cleaner = [PowerShell]::Create().AddScript({
-                param($path)
-                Start-Sleep -Seconds 4
-                if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
-            }).AddArgument($bootLockFile)
-            $cleaner.BeginInvoke() | Out-Null
-        } catch {}
+function Rebind-ConversationArgs([string[]]$AgyArgs) {
+    $quotaScript = Get-QuotaScriptPath
+    $activeConvId = $null
+    $needsLatest = $false
+    [string[]]$updatedArgs = @()
 
-        # Swap in profile credential before launching agy
-        if (Test-Path $tokenFile) {
-            $tokenData = [System.IO.File]::ReadAllText($tokenFile, [System.Text.Encoding]::UTF8)
-            [WinCredManager]::WriteCredential("gemini:antigravity", $tokenData) | Out-Null
-        } else {
-            [WinCredManager]::DeleteCredential("gemini:antigravity") | Out-Null
+    if ($AgyArgs) {
+        for ($i = 0; $i -lt $AgyArgs.Count; $i++) {
+            $arg = $AgyArgs[$i]
+            if ($arg -match "^--conversation=(.+)$") {
+                $activeConvId = $matches[1]
+                $updatedArgs += $arg
+            } elseif ($arg -eq "--conversation" -and ($i + 1) -lt $AgyArgs.Count) {
+                $activeConvId = $AgyArgs[$i + 1]
+                $updatedArgs += $arg
+                $updatedArgs += $activeConvId
+                $i++
+            } elseif ($arg -in @("-c", "--continue")) {
+                $needsLatest = $true
+                $updatedArgs += $arg
+            } else {
+                $updatedArgs += $arg
+            }
         }
     }
 
-    $prevUserProfile = $env:USERPROFILE
-    $prevHome = $env:HOME
-    try {
-        $env:USERPROFILE = $targetDir
-        $env:HOME = $targetDir
-        Write-Host "Starting agy with profile '$ProfileName'..." -ForegroundColor Cyan
-        & agy @AgyArgs
-    } finally {
-        # Ensure boot lock is cleaned up if session exited early
-        if (Test-Path $bootLockFile) {
+    if ($quotaScript) {
+        if ($activeConvId) {
             try {
-                $content = [System.IO.File]::ReadAllText($bootLockFile)
-                if ($content -like "*$PID*") {
-                    Remove-Item $bootLockFile -Force -ErrorAction SilentlyContinue
+                & python $quotaScript --rebind $activeConvId 2>$null | Out-Null
+            } catch {}
+        } elseif ($needsLatest) {
+            try {
+                $resolved = (& python $quotaScript --rebind latest 2>$null | Out-String).Trim()
+                if ($LASTEXITCODE -eq 0 -and $resolved) {
+                    $activeConvId = $resolved
+                    [string[]]$rewritten = @()
+                    $replaced = $false
+                    foreach ($a in $updatedArgs) {
+                        if (-not $replaced -and ($a -in @("-c", "--continue"))) {
+                            $rewritten += "--conversation"
+                            $rewritten += $activeConvId
+                            $replaced = $true
+                        } else {
+                            $rewritten += $a
+                        }
+                    }
+                    $updatedArgs = $rewritten
                 }
             } catch {}
         }
+    }
 
-        # Save updated credential back to profile ONLY if it belongs to this profile
+    return @{
+        Args   = $updatedArgs
+        ConvId = $activeConvId
+    }
+}
+
+function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId) {
+    [string[]]$filtered = @()
+    if ($OriginalArgs) {
+        for ($i = 0; $i -lt $OriginalArgs.Count; $i++) {
+            $arg = $OriginalArgs[$i]
+            if ($arg -match "^--conversation=") {
+                continue
+            } elseif ($arg -eq "--conversation") {
+                $i++
+                continue
+            } elseif ($arg -in @("-c", "--continue")) {
+                continue
+            } else {
+                $filtered += $arg
+            }
+        }
+    }
+    return @("--conversation", $ConvId) + $filtered
+}
+
+function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
+    $currentProfile = $ProfileName
+    [string[]]$currentArgs = if ($AgyArgs) { $AgyArgs } else { @() }
+    $noFailover = ($env:MGY_NO_FAILOVER -eq "1") -or ($env:MULTIGRAVITY_AUTO_FAILOVER -in @("0", "false", "FALSE"))
+    if ($currentArgs -contains "--no-failover") {
+        $noFailover = $true
+        $currentArgs = @($currentArgs | Where-Object { $_ -ne "--no-failover" })
+    }
+    if ($currentArgs -contains "--version" -or $currentArgs -contains "-v" -or $currentArgs -contains "--help" -or $currentArgs -contains "-h") {
+        $noFailover = $true
+    }
+    $triedProfiles = @($currentProfile)
+    $quotaScript = Get-QuotaScriptPath
+
+    while ($true) {
+        $targetDir = Join-Path $ProfilesDir $currentProfile
+        if (-not (Test-Path $targetDir)) {
+            Write-Error "Error: profile '$currentProfile' does not exist. Create it first using: mgy new $currentProfile"
+            exit 1
+        }
+
+        Setup-ProfileEnvironment -TargetDir $targetDir
+
+        # Rebind SQLite trajectory_meta if resuming an existing conversation (--conversation or -c)
+        $rebound = Rebind-ConversationArgs -AgyArgs $currentArgs
+        $currentArgs = $rebound.Args
+        $activeConvId = $rebound.ConvId
+
+        Ensure-WinCredManager
+        $hasWinCred = ([System.Management.Automation.PSTypeName]'WinCredManager').Type -ne $null
+        $tokensDir = Join-Path $targetDir ".tokens"
+        $tokenFile = Join-Path $tokensDir "credential.txt"
+        $bootLockFile = Join-Path $ProfilesDir ".wincred_boot.lock"
+        $tokenData = $null
+
+        # Startup synchronization: Ensure only one agy instance reads WinCred at a time
         if ($hasWinCred) {
-            $savedCred = [WinCredManager]::ReadCredential("gemini:antigravity")
-            if ($savedCred) {
-                $savedAccount = Get-ProfileTokenAccount $savedCred
-                $initialAccount = Get-ProfileTokenAccount $tokenData
-
-                $shouldSave = $false
-                if (-not $tokenData -or -not (Test-Path $tokenFile)) {
-                    $shouldSave = $true
-                } elseif ($initialAccount -and $savedAccount -and ($initialAccount -eq $savedAccount)) {
-                    $shouldSave = $true
-                } elseif (-not $initialAccount -and -not $savedAccount) {
-                    $shouldSave = $true
-                } else {
-                    Write-Host "[!] mgy: Skipped saving credential for '$ProfileName' ($initialAccount) because Windows Credential Manager holds a different account ($savedAccount)." -ForegroundColor DarkGray
+            $waitRetries = 0
+            while ($true) {
+                try {
+                    $lockStream = [System.IO.File]::Open($bootLockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                    $lockBytes = [System.Text.Encoding]::UTF8.GetBytes("$PID - $currentProfile")
+                    $lockStream.Write($lockBytes, 0, $lockBytes.Length)
+                    $lockStream.Close()
+                    break
+                } catch [System.IO.IOException] {
+                    if (Test-Path $bootLockFile) {
+                        $age = (Get-Date) - (Get-Item $bootLockFile).LastWriteTime
+                        if ($age.TotalSeconds -gt 8) {
+                            Remove-Item $bootLockFile -Force -ErrorAction SilentlyContinue
+                            continue
+                        }
+                    }
+                    Write-Host "[*] Multigravity: Waiting for worker initialization slot ($currentProfile)..." -ForegroundColor DarkGray
+                    Start-Sleep -Milliseconds 600
+                    $waitRetries++
+                    if ($waitRetries -gt 35) {
+                        Remove-Item $bootLockFile -Force -ErrorAction SilentlyContinue
+                        break
+                    }
+                } catch {
+                    break
                 }
+            }
 
-                if ($shouldSave) {
-                    if (-not (Test-Path $tokensDir)) { New-Item -ItemType Directory -Path $tokensDir -Force | Out-Null }
-                    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                    [System.IO.File]::WriteAllText($tokenFile, $savedCred, $utf8NoBom)
+            # Background cleaner to release boot lock after agy reads the credential into memory (4 seconds)
+            try {
+                $cleaner = [PowerShell]::Create().AddScript({
+                    param($path)
+                    Start-Sleep -Seconds 4
+                    if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+                }).AddArgument($bootLockFile)
+                $cleaner.BeginInvoke() | Out-Null
+            } catch {}
+
+            # Swap in profile credential before launching agy
+            if (Test-Path $tokenFile) {
+                $tokenData = [System.IO.File]::ReadAllText($tokenFile, [System.Text.Encoding]::UTF8)
+                [WinCredManager]::WriteCredential("gemini:antigravity", $tokenData) | Out-Null
+            } else {
+                [WinCredManager]::DeleteCredential("gemini:antigravity") | Out-Null
+            }
+        }
+
+        $sessionStartEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $prevUserProfile = $env:USERPROFILE
+        $prevHome = $env:HOME
+        try {
+            $env:USERPROFILE = $targetDir
+            $env:HOME = $targetDir
+            Write-Host "Starting agy with profile '$currentProfile'..." -ForegroundColor Cyan
+            & agy @currentArgs
+        } finally {
+            # Ensure boot lock is cleaned up if session exited early
+            if (Test-Path $bootLockFile) {
+                try {
+                    $content = [System.IO.File]::ReadAllText($bootLockFile)
+                    if ($content -like "*$PID*") {
+                        Remove-Item $bootLockFile -Force -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+
+            # Save updated credential back to profile ONLY if it belongs to this profile
+            if ($hasWinCred) {
+                $savedCred = [WinCredManager]::ReadCredential("gemini:antigravity")
+                if ($savedCred) {
+                    $savedAccount = Get-ProfileTokenAccount $savedCred
+                    $initialAccount = Get-ProfileTokenAccount $tokenData
+
+                    $shouldSave = $false
+                    if (-not $tokenData -or -not (Test-Path $tokenFile)) {
+                        $shouldSave = $true
+                    } elseif ($initialAccount -and $savedAccount -and ($initialAccount -eq $savedAccount)) {
+                        $shouldSave = $true
+                    } elseif (-not $initialAccount -and -not $savedAccount) {
+                        $shouldSave = $true
+                    } else {
+                        Write-Host "[!] mgy: Skipped saving credential for '$currentProfile' ($initialAccount) because Windows Credential Manager holds a different account ($savedAccount)." -ForegroundColor DarkGray
+                    }
+
+                    if ($shouldSave) {
+                        if (-not (Test-Path $tokensDir)) { New-Item -ItemType Directory -Path $tokensDir -Force | Out-Null }
+                        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+                        [System.IO.File]::WriteAllText($tokenFile, $savedCred, $utf8NoBom)
+                    }
+                }
+            }
+            $env:USERPROFILE = $prevUserProfile
+            $env:HOME = $prevHome
+        }
+
+        # Process-level quota exhaustion check & automatic session resume on next best profile
+        if (-not $noFailover -and $quotaScript) {
+            if (-not $activeConvId) {
+                try {
+                    $foundConv = (& python $quotaScript --find-active-conv --since $sessionStartEpoch 2>$null | Out-String).Trim()
+                    if ($LASTEXITCODE -eq 0 -and $foundConv) {
+                        $activeConvId = $foundConv
+                    }
+                } catch {}
+            }
+
+            if ($activeConvId) {
+                $modelHint = Get-ModelHintFromArgs -AgyArgs $currentArgs
+                $chkArgs = @("--check-exhausted", $currentProfile, "--conv-id", $activeConvId)
+                if ($modelHint) { $chkArgs += @("--model", $modelHint) }
+                $checkOut = (& python $quotaScript @chkArgs 2>$null | Out-String).Trim()
+                if ($LASTEXITCODE -eq 0 -and $checkOut.StartsWith("EXHAUSTED|")) {
+                    $chkParts = $checkOut.Split("|")
+                    $exPct = $chkParts[1]
+                    $exProv = $chkParts[2]
+                    Write-Host ""
+                    Write-Host "[!] Quota reached on profile '$currentProfile' (${exProv}: $exPct% remaining)." -ForegroundColor Yellow
+                    $nextBest = Select-BestProfile -Exclude ($triedProfiles -join ",") -ModelHint $modelHint
+                    if ($nextBest -and $nextBest.Profile) {
+                        Write-Host "==> Switching to profile '$($nextBest.Profile)' [$($nextBest.Tier)] ($($nextBest.Provider): $($nextBest.TargetPct)% available) and resuming conversation '$activeConvId'..." -ForegroundColor Green
+                        $currentProfile = $nextBest.Profile
+                        $triedProfiles += $currentProfile
+                        $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId
+                        continue
+                    } else {
+                        Write-Host "[!] No other authenticated profiles have remaining quota for $exProv." -ForegroundColor Red
+                    }
                 }
             }
         }
-        $env:USERPROFILE = $prevUserProfile
-        $env:HOME = $prevHome
+        break
     }
 }
 
@@ -1018,24 +1216,79 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         }
     }
 
+    { $_ -in @("best", "auto") } {
+        $modelHint = Get-ModelHintFromArgs -AgyArgs $RemainingArgs
+        $best = Select-BestProfile -ModelHint $modelHint
+        if (-not $best -or -not $best.Profile) {
+            Write-Error "Error: Could not find any authenticated profile with remaining quota. Run 'mgy quotas' to inspect."
+            exit 1
+        }
+        Write-Host "==> Selected best profile: '$($best.Profile)' [$($best.Tier)] ($($best.Provider): $($best.TargetPct)% quota available)" -ForegroundColor Green
+        Start-ProfileSession -ProfileName $best.Profile -AgyArgs $RemainingArgs
+    }
+
+    "resume" {
+        $targetProf = $null
+        [string[]]$resumeArgs = @()
+
+        if ($RemainingArgs.Count -eq 0) {
+            $resumeArgs = @("-c")
+        } elseif ((Test-Path (Join-Path $ProfilesDir $RemainingArgs[0])) -and ($RemainingArgs[0] -notmatch "^-")) {
+            $targetProf = $RemainingArgs[0]
+            $rest = @($RemainingArgs | Select-Object -Skip 1)
+            if ($rest.Count -eq 0) {
+                $resumeArgs = @("-c")
+            } elseif ($rest[0] -notmatch "^-") {
+                $resumeArgs = @("--conversation", $rest[0]) + @($rest | Select-Object -Skip 1)
+            } else {
+                $resumeArgs = $rest
+            }
+        } elseif ($RemainingArgs[0] -notmatch "^-") {
+            $resumeArgs = @("--conversation", $RemainingArgs[0]) + @($RemainingArgs | Select-Object -Skip 1)
+        } else {
+            $resumeArgs = $RemainingArgs
+        }
+
+        if (-not $targetProf) {
+            $modelHint = Get-ModelHintFromArgs -AgyArgs $resumeArgs
+            $best = Select-BestProfile -ModelHint $modelHint
+            if (-not $best -or -not $best.Profile) {
+                Write-Error "Error: Could not find any authenticated profile with remaining quota. Run 'mgy quotas' to inspect."
+                exit 1
+            }
+            $targetProf = $best.Profile
+            Write-Host "==> Selected best profile: '$targetProf' [$($best.Tier)] ($($best.Provider): $($best.TargetPct)% quota available)" -ForegroundColor Green
+        }
+
+        Start-ProfileSession -ProfileName $targetProf -AgyArgs $resumeArgs
+    }
+
     "-*" {
         # Flags passed without explicit profile name (e.g. mgy -c, mgy --conversation=<id>)
+        $allArgs = @($Command) + $RemainingArgs
         $selectedProfile = $env:MULTIGRAVITY_DEFAULT_PROFILE
         if (-not $selectedProfile -or -not (Test-Path (Join-Path $ProfilesDir $selectedProfile))) {
-            $profiles = @(Get-ChildItem -Path $ProfilesDir -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+            $profiles = @(Get-ChildItem -Path $ProfilesDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith(".") } | Select-Object -ExpandProperty Name)
             if ($profiles.Count -eq 1 -and $profiles[0]) {
                 $selectedProfile = $profiles[0]
             } elseif ($profiles.Count -eq 0) {
                 Write-Error "Error: No profiles found. Create one first using: mgy new <profile_name>"
                 exit 1
             } else {
-                Write-Error "Multiple profiles found. Please specify which profile to run: mgy <profile> $Command $($RemainingArgs -join ' ')"
-                Show-ProfilesList
-                exit 1
+                $modelHint = Get-ModelHintFromArgs -AgyArgs $allArgs
+                $best = Select-BestProfile -ModelHint $modelHint
+                if ($best -and $best.Profile) {
+                    $selectedProfile = $best.Profile
+                    Write-Host "==> Selected best profile: '$selectedProfile' [$($best.Tier)] ($($best.Provider): $($best.TargetPct)% quota available)" -ForegroundColor Green
+                } else {
+                    Write-Error "Multiple profiles found. Please specify which profile to run: mgy <profile> $Command $($RemainingArgs -join ' ')"
+                    Show-ProfilesList
+                    exit 1
+                }
             }
         }
 
-        Start-ProfileSession -ProfileName $selectedProfile -AgyArgs (@($Command) + $RemainingArgs)
+        Start-ProfileSession -ProfileName $selectedProfile -AgyArgs $allArgs
     }
 
     default {
