@@ -18,7 +18,7 @@ print_help() {
 Usage: $CMD_NAME [command] [options]
 
 Commands:
-  best, auto [agy args]  Start agy using the profile with the highest remaining quota
+  auto, best [agy args]  Autonomous mode: auto-selects profile, kills on 429 quota exhaustion, & resumes
   resume [id] [agy args] Rebind trajectory_meta and resume conversation on best profile
   new <profile>          Create a new isolated profile and authenticate
   import <profile|tar.gz> Import host session into profile OR import conversation archive
@@ -33,15 +33,15 @@ Commands:
   <profile> [agy args]   Start agy session using the specified profile
 
 Resume & Conversation Flags (same as agy):
-  $CMD_NAME best                            Start session on profile with highest quota
-  $CMD_NAME best -c                         Continue latest conversation on best profile
+  $CMD_NAME auto                            Start session with dynamic quota switching & auto-resume
+  $CMD_NAME auto -c                         Continue latest conversation with dynamic quota switching
   $CMD_NAME resume [conv_id]                Resume latest (or specified) conversation on best profile
   $CMD_NAME <profile> --conversation=<id>   Resume a specific conversation by ID (auto-rebinds trajectory)
   $CMD_NAME <profile> -c, --continue        Continue the most recent conversation (auto-rebinds trajectory)
 
 Examples:
-  $CMD_NAME best                          # Auto-select profile with most quota and start agy
-  $CMD_NAME best -c                       # Continue latest chat on profile with most quota
+  $CMD_NAME auto                          # Dynamic quota switching: auto-kills on 429 and resumes next best account
+  $CMD_NAME auto -c                       # Continue latest chat with dynamic auto-failover
   $CMD_NAME resume <id>                   # Rebind SQLite trajectory and resume chat on best profile
   $CMD_NAME new <profile>                 # Set up a new profile with Google login
   $CMD_NAME list                          # List all registered profiles
@@ -609,6 +609,21 @@ select_best_profile() {
     "$qbin" "${args[@]}" 2>/dev/null
 }
 
+show_all_depleted_alert() {
+    echo ""
+    echo -e "\033[31m================================================================================\033[0m"
+    echo -e "\033[1;31m                    [!] ALL PROFILES DEPLETED [!]\033[0m"
+    echo -e "\033[31m  Every authenticated profile has exhausted its Google Gemini quota.\033[0m"
+    echo -e "\033[33m  No accounts are currently available to continue execution.\033[0m"
+    echo -e "\033[31m================================================================================\033[0m"
+    echo -e "\033[90mRun '$CMD_NAME quotas' to check countdown reset timers across all profiles.\033[0m\n"
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e 'display alert "Multigravity - All Quotas Depleted" message "Every authenticated profile has exhausted its Google Gemini quota.\n\nRun mgy quotas to inspect countdown reset timers."' >/dev/null 2>&1 &
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "Multigravity" "All Gemini quotas depleted across all profiles." >/dev/null 2>&1 &
+    fi
+}
+
 start_profile_session() {
     local current_profile="$1"
     shift
@@ -686,57 +701,99 @@ start_profile_session() {
         local session_start_epoch
         session_start_epoch="$(date +%s)"
 
+        local sentinel_file="$PROFILES_DIR/.exhausted_$$"
+        rm -f "$sentinel_file" 2>/dev/null || true
+        local monitor_pid=""
+        if [ "$no_failover" != "1" ] && [ -n "$qbin" ]; then
+            local mon_args=("$qbin" "--monitor-session" "--profile" "$current_profile" "--parent-pid" "$$" "--since" "$session_start_epoch")
+            [ -n "$active_conv_id" ] && mon_args+=("--conv-id" "$active_conv_id")
+            python3 "${mon_args[@]}" >/dev/null 2>&1 &
+            monitor_pid=$!
+        fi
+
         activate_profile_keychain "$target_dir"
         echo "Starting agy with profile '$current_profile'..."
         USERPROFILE="$target_dir" HOME="$target_dir" agy "${current_args[@]}"
         local status=$?
         restore_profile_keychain "$target_dir"
 
+        [ -n "$monitor_pid" ] && kill -9 "$monitor_pid" 2>/dev/null || true
+
         if [ "$no_failover" != "1" ] && [ -n "$qbin" ]; then
+            local is_exhausted=0
+            local ex_pct="0.0"
+            local ex_prov="Google Gemini"
+
+            if [ -f "$sentinel_file" ]; then
+                is_exhausted=1
+                local sentinel_data
+                sentinel_data="$(cat "$sentinel_file" 2>/dev/null || true)"
+                if [ -n "$sentinel_data" ]; then
+                    local s_conv
+                    IFS='|' read -r s_conv _ <<< "$sentinel_data"
+                    [ -n "$s_conv" ] && [ -z "$active_conv_id" ] && active_conv_id="$s_conv"
+                fi
+                rm -f "$sentinel_file" 2>/dev/null || true
+            fi
+
             if [ -z "$active_conv_id" ]; then
                 local found_conv
                 found_conv="$("$qbin" --find-active-conv --since "$session_start_epoch" 2>/dev/null || true)"
                 [ -n "$found_conv" ] && active_conv_id="$found_conv"
             fi
 
-            if [ -n "$active_conv_id" ]; then
-                local model_hint
-                model_hint="$(get_model_hint_from_args "${current_args[@]}")"
+            local model_hint
+            model_hint="$(get_model_hint_from_args "${current_args[@]}")"
+
+            if [ "$is_exhausted" -eq 0 ] && [ -n "$active_conv_id" ]; then
                 local chk_args=("--check-exhausted" "$current_profile" "--conv-id" "$active_conv_id")
                 [ -n "$model_hint" ] && chk_args+=("--model" "$model_hint")
                 local check_out
                 if check_out="$("$qbin" "${chk_args[@]}" 2>/dev/null)" && [[ "$check_out" == EXHAUSTED\|* ]]; then
-                    local ex_pct ex_prov
+                    is_exhausted=1
                     IFS='|' read -r _ ex_pct ex_prov _ <<< "$check_out"
-                    echo ""
-                    echo "[!] Quota reached on profile '$current_profile' ($ex_prov: ${ex_pct}% remaining)."
-                    local next_detail
-                    if next_detail="$(select_best_profile "$tried_profiles" "$model_hint")" && [ -n "$next_detail" ]; then
-                        local next_prof next_tier next_pct _ next_prov
-                        IFS='|' read -r next_prof next_tier next_pct _ next_prov <<< "$next_detail"
-                        echo "==> Switching to profile '$next_prof' [$next_tier] ($next_prov: ${next_pct}% available) and resuming conversation '$active_conv_id'..."
-                        current_profile="$next_prof"
-                        tried_profiles="${tried_profiles},${current_profile}"
+                fi
+            fi
 
-                        local failover_args=("--conversation" "$active_conv_id")
-                        local skip_next=0
-                        for a in "${current_args[@]}"; do
-                            if [ "$skip_next" -eq 1 ]; then
-                                skip_next=0
-                                continue
-                            fi
-                            case "$a" in
-                                --conversation=*) ;;
-                                --conversation) skip_next=1 ;;
-                                -c|--continue) ;;
-                                *) failover_args+=("$a") ;;
-                            esac
-                        done
-                        current_args=("${failover_args[@]}")
-                        continue
-                    else
-                        echo "[!] No other authenticated profiles have remaining quota for $ex_prov."
-                    fi
+            if [ "$is_exhausted" -eq 1 ]; then
+                echo ""
+                echo "[!] Quota reached on profile '$current_profile' ($ex_prov: ${ex_pct}% remaining)."
+                [ -n "$active_conv_id" ] && "$qbin" --rebind "$active_conv_id" >/dev/null 2>&1 || true
+
+                local next_detail
+                if next_detail="$(select_best_profile "$tried_profiles" "$model_hint")" && [ -n "$next_detail" ]; then
+                    local next_prof next_tier next_pct _ next_prov
+                    IFS='|' read -r next_prof next_tier next_pct _ next_prov <<< "$next_detail"
+                    echo "==> Dynamic Account Switch: Resuming on '$next_prof' [$next_tier] ($next_prov: ${next_pct}% available)..."
+                    echo "==> Reopening conversation '$active_conv_id' with prompt:"
+                    echo "    '/goal resume what you were doing before the quota depleted'"
+                    current_profile="$next_prof"
+                    tried_profiles="${tried_profiles},${current_profile}"
+
+                    local is_print=0
+                    local failover_args=()
+                    local skip_next=0
+                    for a in "${current_args[@]}"; do
+                        if [ "$skip_next" -eq 1 ]; then
+                            skip_next=0
+                            continue
+                        fi
+                        case "$a" in
+                            --conversation=*) ;;
+                            --conversation) skip_next=1 ;;
+                            -c|--continue) ;;
+                            -i|--prompt-interactive) skip_next=1 ;;
+                            -p|--print|--prompt) is_print=1; skip_next=1 ;;
+                            *) failover_args+=("$a") ;;
+                        esac
+                    done
+                    local p_flag="-i"
+                    [ "$is_print" -eq 1 ] && p_flag="-p"
+                    current_args=("--conversation" "$active_conv_id" "$p_flag" "/goal resume what you were doing before the quota depleted" "${failover_args[@]}")
+                    continue
+                else
+                    show_all_depleted_alert
+                    exit 1
                 fi
             fi
         fi
@@ -1068,7 +1125,7 @@ EOF
         model_hint=$(get_model_hint_from_args "$@")
         best_detail=$(select_best_profile "" "$model_hint")
         if [ -z "$best_detail" ]; then
-            echo "Error: Could not find any authenticated profile with remaining quota. Run '$CMD_NAME quotas' to inspect." >&2
+            show_all_depleted_alert
             exit 1
         fi
         IFS='|' read -r best_profile best_tier best_pct _ best_prov <<< "$best_detail"
@@ -1103,7 +1160,7 @@ EOF
             model_hint=$(get_model_hint_from_args "${resume_args[@]}")
             best_detail=$(select_best_profile "" "$model_hint")
             if [ -z "$best_detail" ]; then
-                echo "Error: Could not find any authenticated profile with remaining quota. Run '$CMD_NAME quotas' to inspect." >&2
+                show_all_depleted_alert
                 exit 1
             fi
             IFS='|' read -r target_prof best_tier best_pct _ best_prov <<< "$best_detail"

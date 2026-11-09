@@ -126,21 +126,35 @@ Launch interactive sessions under separate profiles in separate terminal tabs, w
 
 Both instances execute simultaneously with full token and quota isolation while sharing all history and settings.
 
-#### Smart Profile Selection (`mgy best`) & Cross-Profile Resume (`mgy resume`)
-`mgy` can automatically inspect quotas across all profiles and launch `agy` using the account with the highest remaining quota for your active model/provider:
+#### Dynamic Quota Switching & Autonomous Resume (`mgy auto`)
+`mgy auto` is the recommended way to run Antigravity. It dynamically manages your accounts and quotas with zero manual intervention:
+
+1. **Smart Profile Selection**: Evaluates Gemini quotas across all your accounts and starts `agy` using the profile with the highest remaining quota.
+2. **Real-time Watchdog**: Runs an ultralight background monitor tracking child process output and API limits.
+3. **Instant Auto-Kill & Failover**: The instant Google returns `RESOURCE_EXHAUSTED` (HTTP 429) mid-stream, `mgy auto` immediately terminates the exhausted process.
+4. **Autonomous Resumption**: Automatically rebinds SQLite `trajectory_meta`, switches to the next best account, and resumes your active conversation with:
+   ```text
+   "/goal resume what you were doing before the quota depleted"
+   ```
+5. **Depleted Alert**: If every configured profile runs out of quota, `mgy auto` displays a prominent notification banner with countdown reset timers.
 
 ```bash
-# Automatically pick the profile with the highest remaining quota and start agy:
-mgy best
-mgy auto --model claude-sonnet-4-6
+# Start or continue with dynamic quota switching:
+mgy auto
 
-# Rebind trajectory metadata and resume the latest (or specific) conversation on the best available profile:
-mgy resume
-mgy resume <conversation_id>
+# Continue the latest conversation with auto-switching:
+mgy auto -c
+
+# Resume a specific conversation with auto-switching:
+mgy auto --conversation <conversation_id>
+
+# Run non-interactively or with custom flags:
+mgy auto -p "Implement the user auth module" --dangerously-skip-permissions
 ```
+*(Note: `mgy best` is an alias for `mgy auto`)*
 
 #### Resuming Conversations Across Profiles & Automatic Failover
-Because conversations and history are shared globally, you can resume any conversation under any account. `mgy` automatically rebinds `trajectory_meta` in SQLite when resuming (`--conversation` or `-c`) so switching accounts never causes trajectory ownership collisions, and automatically fails over to the next profile with available quota if your active profile hits `0%` quota when a session ends:
+Because conversations and history are shared globally, you can resume any conversation under any account. `mgy` automatically rebinds `trajectory_meta` in SQLite when resuming (`--conversation` or `-c`) so switching accounts never causes trajectory ownership collisions, and automatically fails over to the next profile with available quota if your active profile hits `0%` quota:
 
 ```bash
 # View recent conversation IDs:
@@ -230,7 +244,7 @@ Both `mgy` and `multigravity` can be used interchangeably:
 
 | Command                             | Description                                                                                                                      |
 | :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
-| `mgy best [args...]`, `mgy auto`    | Automatically selects the profile with the highest remaining quota for your active model and starts `agy`.                       |
+| `mgy auto [args...]`, `mgy best`    | Starts `agy` on the highest quota profile; on quota exhaustion, kills process, switches accounts, and resumes automatically with `/goal resume...` |
 | `mgy resume [conv_id] [args...]`    | Rebinds `trajectory_meta` in SQLite and resumes the conversation on the profile with the highest remaining quota.                |
 | `mgy <profile> --conversation=<id>` | Rebinds `trajectory_meta` and resumes a specific conversation by ID (same as `agy --conversation=<id>`).                         |
 | `mgy <profile> -c`, `--continue`    | Continues the most recent conversation (auto-rebinding `trajectory_meta`).                                                       |

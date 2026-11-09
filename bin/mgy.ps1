@@ -130,7 +130,7 @@ function Show-Help {
 Usage: mgy [command] [options]
 
 Commands:
-  best, auto [agy args]  Start agy using the profile with the highest remaining quota
+  auto, best [agy args]  Autonomous mode: auto-selects profile, kills on 429 quota exhaustion, & resumes
   resume [id] [agy args] Rebind trajectory_meta and resume conversation on best profile
   new <profile>          Create a new isolated profile and authenticate
   import <profile|tar.gz> Import host session into profile OR import conversation archive
@@ -145,15 +145,15 @@ Commands:
   <profile> [agy args]   Start agy session using the specified profile
 
 Resume & Conversation Flags (same as agy):
-  mgy best                            Start session on profile with highest quota
-  mgy best -c                         Continue latest conversation on best profile
+  mgy auto                            Start session with dynamic quota switching & auto-resume
+  mgy auto -c                         Continue latest conversation with dynamic quota switching
   mgy resume [conv_id]                Resume latest (or specified) conversation on best profile
   mgy <profile> --conversation=<id>   Resume a specific conversation by ID (auto-rebinds trajectory)
   mgy <profile> -c, --continue        Continue the most recent conversation (auto-rebinds trajectory)
 
 Examples:
-  mgy best                     # Auto-select profile with most quota and start agy
-  mgy best -c                  # Continue latest chat on profile with most quota
+  mgy auto                     # Dynamic quota switching: auto-kills on 429 and resumes next best account
+  mgy auto -c                  # Continue latest chat with dynamic auto-failover
   mgy resume <id>              # Rebind SQLite trajectory and resume chat on best profile
   mgy new work                 # Set up a new profile with Google login
   mgy list                     # List all registered profiles
@@ -530,8 +530,9 @@ function Rebind-ConversationArgs([string[]]$AgyArgs) {
     }
 }
 
-function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId) {
+function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId, [string]$ResumePrompt = "/goal resume what you were doing before the quota depleted") {
     [string[]]$filtered = @()
+    $isPrint = $false
     if ($OriginalArgs) {
         for ($i = 0; $i -lt $OriginalArgs.Count; $i++) {
             $arg = $OriginalArgs[$i]
@@ -542,12 +543,39 @@ function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId) {
                 continue
             } elseif ($arg -in @("-c", "--continue")) {
                 continue
+            } elseif ($arg -in @("-i", "--prompt-interactive")) {
+                $i++
+                continue
+            } elseif ($arg -in @("-p", "--print", "--prompt")) {
+                $isPrint = $true
+                $i++
+                continue
             } else {
                 $filtered += $arg
             }
         }
     }
-    return @("--conversation", $ConvId) + $filtered
+    $promptFlag = if ($isPrint) { "-p" } else { "-i" }
+    return @("--conversation", $ConvId, $promptFlag, $ResumePrompt) + $filtered
+}
+
+function Show-AllDepletedAlert {
+    Write-Host ""
+    Write-Host "================================================================================" -ForegroundColor Red
+    Write-Host "                    [!] ALL PROFILES DEPLETED [!]" -ForegroundColor Red
+    Write-Host "  Every authenticated profile has exhausted its Google Gemini quota." -ForegroundColor Red
+    Write-Host "  No accounts are currently available to continue execution." -ForegroundColor Yellow
+    Write-Host "================================================================================" -ForegroundColor Red
+    Write-Host "Run 'mgy quotas' to check countdown reset timers across all profiles.`n" -ForegroundColor DarkGray
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        $mbScript = {
+            param($msg, $title)
+            [System.Windows.Forms.MessageBox]::Show($msg, $title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        }
+        $ps = [PowerShell]::Create().AddScript($mbScript).AddArgument("Every authenticated profile has exhausted its Google Gemini quota.`n`nRun 'mgy quotas' to inspect countdown reset timers.", "Multigravity - All Quotas Depleted")
+        $ps.BeginInvoke() | Out-Null
+    } catch {}
 }
 
 function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
@@ -637,12 +665,32 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
         $sessionStartEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $prevUserProfile = $env:USERPROFILE
         $prevHome = $env:HOME
+
+        # Start background monitor to watch and kill agy if quota depletes
+        $monitorProc = $null
+        $sentinelFile = Join-Path $ProfilesDir ".exhausted_$PID"
+        if (Test-Path $sentinelFile) { Remove-Item $sentinelFile -Force -ErrorAction SilentlyContinue }
+
+        if (-not $noFailover -and $quotaScript) {
+            try {
+                $monArgs = @($quotaScript, "--monitor-session", "--profile", $currentProfile, "--parent-pid", "$PID", "--since", "$sessionStartEpoch")
+                if ($activeConvId) {
+                    $monArgs += @("--conv-id", $activeConvId)
+                }
+                $monitorProc = Start-Process python -ArgumentList $monArgs -WindowStyle Hidden -PassThru
+            } catch {}
+        }
+
         try {
             $env:USERPROFILE = $targetDir
             $env:HOME = $targetDir
             Write-Host "Starting agy with profile '$currentProfile'..." -ForegroundColor Cyan
             & agy @currentArgs
         } finally {
+            if ($monitorProc -and -not $monitorProc.HasExited) {
+                try { Stop-Process -Id $monitorProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            }
+
             # Ensure boot lock is cleaned up if session exited early
             if (Test-Path $bootLockFile) {
                 try {
@@ -684,6 +732,20 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
 
         # Process-level quota exhaustion check & automatic session resume on next best profile
         if (-not $noFailover -and $quotaScript) {
+            $monitorTriggered = Test-Path $sentinelFile
+            if ($monitorTriggered) {
+                try {
+                    $sentinelData = (Get-Content $sentinelFile -ErrorAction SilentlyContinue).Trim()
+                    if ($sentinelData) {
+                        $sParts = $sentinelData.Split("|")
+                        if ($sParts.Count -gt 0 -and $sParts[0] -and -not $activeConvId) {
+                            $activeConvId = $sParts[0]
+                        }
+                    }
+                } catch {}
+                Remove-Item $sentinelFile -Force -ErrorAction SilentlyContinue
+            }
+
             if (-not $activeConvId) {
                 try {
                     $foundConv = (& python $quotaScript --find-active-conv --since $sessionStartEpoch 2>$null | Out-String).Trim()
@@ -693,27 +755,41 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
                 } catch {}
             }
 
-            if ($activeConvId) {
+            $isExhausted = $monitorTriggered
+            $exPct = "0.0"
+            $exProv = "Google Gemini"
+
+            if (-not $isExhausted -and $activeConvId) {
                 $modelHint = Get-ModelHintFromArgs -AgyArgs $currentArgs
                 $chkArgs = @("--check-exhausted", $currentProfile, "--conv-id", $activeConvId)
                 if ($modelHint) { $chkArgs += @("--model", $modelHint) }
                 $checkOut = (& python $quotaScript @chkArgs 2>$null | Out-String).Trim()
                 if ($LASTEXITCODE -eq 0 -and $checkOut.StartsWith("EXHAUSTED|")) {
+                    $isExhausted = $true
                     $chkParts = $checkOut.Split("|")
                     $exPct = $chkParts[1]
                     $exProv = $chkParts[2]
-                    Write-Host ""
-                    Write-Host "[!] Quota reached on profile '$currentProfile' (${exProv}: $exPct% remaining)." -ForegroundColor Yellow
-                    $nextBest = Select-BestProfile -Exclude ($triedProfiles -join ",") -ModelHint $modelHint
-                    if ($nextBest -and $nextBest.Profile) {
-                        Write-Host "==> Switching to profile '$($nextBest.Profile)' [$($nextBest.Tier)] ($($nextBest.Provider): $($nextBest.TargetPct)% available) and resuming conversation '$activeConvId'..." -ForegroundColor Green
-                        $currentProfile = $nextBest.Profile
-                        $triedProfiles += $currentProfile
-                        $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId
-                        continue
-                    } else {
-                        Write-Host "[!] No other authenticated profiles have remaining quota for $exProv." -ForegroundColor Red
-                    }
+                }
+            }
+
+            if ($isExhausted) {
+                Write-Host ""
+                Write-Host "[!] Quota reached on profile '$currentProfile' (${exProv}: $exPct% remaining)." -ForegroundColor Yellow
+                if ($activeConvId) {
+                    try { & python $quotaScript --rebind $activeConvId 2>$null | Out-Null } catch {}
+                }
+                $nextBest = Select-BestProfile -Exclude ($triedProfiles -join ",") -ModelHint $modelHint
+                if ($nextBest -and $nextBest.Profile) {
+                    Write-Host "==> Dynamic Account Switch: Resuming on '$($nextBest.Profile)' [$($nextBest.Tier)] ($($nextBest.Provider): $($nextBest.TargetPct)% available)..." -ForegroundColor Green
+                    Write-Host "==> Reopening conversation '$activeConvId' with prompt:" -ForegroundColor Cyan
+                    Write-Host "    '/goal resume what you were doing before the quota depleted'" -ForegroundColor Cyan
+                    $currentProfile = $nextBest.Profile
+                    $triedProfiles += $currentProfile
+                    $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId -ResumePrompt "/goal resume what you were doing before the quota depleted"
+                    continue
+                } else {
+                    Show-AllDepletedAlert
+                    exit 1
                 }
             }
         }
@@ -1221,7 +1297,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         $modelHint = Get-ModelHintFromArgs -AgyArgs $RemainingArgs
         $best = Select-BestProfile -ModelHint $modelHint
         if (-not $best -or -not $best.Profile) {
-            Write-Error "Error: Could not find any authenticated profile with remaining quota. Run 'mgy quotas' to inspect."
+            Show-AllDepletedAlert
             exit 1
         }
         Write-Host "==> Selected best profile: '$($best.Profile)' [$($best.Tier)] ($($best.Provider): $($best.TargetPct)% quota available)" -ForegroundColor Green
@@ -1254,7 +1330,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
             $modelHint = Get-ModelHintFromArgs -AgyArgs $resumeArgs
             $best = Select-BestProfile -ModelHint $modelHint
             if (-not $best -or -not $best.Profile) {
-                Write-Error "Error: Could not find any authenticated profile with remaining quota. Run 'mgy quotas' to inspect."
+                Show-AllDepletedAlert
                 exit 1
             }
             $targetProf = $best.Profile

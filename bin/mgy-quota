@@ -1294,6 +1294,201 @@ def has_recent_quota_error(conv_id):
 
     return False
 
+def is_pid_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(0x1000, False, pid)
+            if not h:
+                return False
+            ec = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(h, ctypes.byref(ec)):
+                kernel32.CloseHandle(h)
+                return ec.value == 259
+            kernel32.CloseHandle(h)
+            return True
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+def find_child_agy_pid(parent_pid):
+    if not parent_pid or parent_pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ('dwSize', wintypes.DWORD),
+                    ('cntUsage', wintypes.DWORD),
+                    ('th32ProcessID', wintypes.DWORD),
+                    ('th32DefaultHeapID', ctypes.c_size_t),
+                    ('th32ModuleID', wintypes.DWORD),
+                    ('cntThreads', wintypes.DWORD),
+                    ('th32ParentProcessID', wintypes.DWORD),
+                    ('pcPriClassBase', wintypes.LONG),
+                    ('dwFlags', wintypes.DWORD),
+                    ('szExeFile', ctypes.c_char * 260)
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            hSnapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+            if not hSnapshot or hSnapshot == -1:
+                return None
+            pe = PROCESSENTRY32()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            found_pid = None
+            fallback_pid = None
+            if kernel32.Process32First(hSnapshot, ctypes.byref(pe)):
+                while True:
+                    if pe.th32ParentProcessID == parent_pid:
+                        exe = pe.szExeFile.decode('utf-8', errors='ignore').lower()
+                        if 'agy' in exe:
+                            found_pid = pe.th32ProcessID
+                            break
+                        elif exe not in ('python.exe', 'pythonw.exe', 'conhost.exe', 'powershell.exe', 'cmd.exe'):
+                            fallback_pid = pe.th32ProcessID
+                    if not kernel32.Process32Next(hSnapshot, ctypes.byref(pe)):
+                        break
+            kernel32.CloseHandle(hSnapshot)
+            return found_pid or fallback_pid
+        except Exception:
+            return None
+    else:
+        try:
+            out = subprocess.check_output(["pgrep", "-P", str(parent_pid)], stderr=subprocess.DEVNULL).decode().strip()
+            fallback_pid = None
+            for line in out.splitlines():
+                c_pid = int(line.strip())
+                comm = subprocess.check_output(["ps", "-p", str(c_pid), "-o", "comm="], stderr=subprocess.DEVNULL).decode().strip().lower()
+                if "agy" in comm:
+                    return c_pid
+                elif "python" not in comm and "bash" not in comm and "sh" not in comm:
+                    fallback_pid = c_pid
+            return fallback_pid
+        except Exception:
+            pass
+        return None
+
+def kill_pid_tree(pid):
+    if not pid or pid <= 0:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    else:
+        try:
+            import signal
+            try:
+                cpids = subprocess.check_output(["pgrep", "-P", str(pid)], stderr=subprocess.DEVNULL).decode().split()
+                for c in cpids:
+                    kill_pid_tree(int(c.strip()))
+            except Exception:
+                pass
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+def monitor_session(profile, parent_pid, conv_id=None, since_epoch=None):
+    """
+    Background worker that monitors the active agy session.
+    As soon as Gemini quota is depleted, it writes a sentinel file and kills
+    the agy process so mgy auto can dynamically switch accounts and resume.
+    """
+    if since_epoch is None:
+        since_epoch = time.time() - 2.0
+
+    marker_file = os.path.join(get_profiles_dir(), f".exhausted_{parent_pid}")
+    if os.path.exists(marker_file):
+        try:
+            os.remove(marker_file)
+        except Exception:
+            pass
+
+    resolved_conv = conv_id if (conv_id and conv_id != "latest") else None
+    last_api_check = time.time()
+    source_dir = os.path.join(get_real_home(), ".gemini", "antigravity-cli")
+    transcript_offset = 0
+    if resolved_conv:
+        t_path = os.path.join(source_dir, "brain", resolved_conv, ".system_generated", "logs", "transcript.jsonl")
+        if os.path.exists(t_path):
+            transcript_offset = max(0, os.path.getsize(t_path) - 2048)
+
+    while True:
+        time.sleep(1.2)
+
+        # 1. Exit if parent process is dead
+        if parent_pid and not is_pid_alive(parent_pid):
+            break
+
+        # 2. Find agy child PID
+        agy_pid = find_child_agy_pid(parent_pid) if parent_pid else None
+
+        # 3. Resolve conv_id if not known
+        if not resolved_conv:
+            found = find_latest_conversation_id(since_epoch=since_epoch)
+            if found:
+                resolved_conv = found
+                t_path = os.path.join(source_dir, "brain", resolved_conv, ".system_generated", "logs", "transcript.jsonl")
+                if os.path.exists(t_path):
+                    transcript_offset = max(0, os.path.getsize(t_path) - 2048)
+
+        # 4. Check transcript.jsonl for quota errors
+        exhausted = False
+        if resolved_conv:
+            t_path = os.path.join(source_dir, "brain", resolved_conv, ".system_generated", "logs", "transcript.jsonl")
+            if os.path.exists(t_path):
+                try:
+                    f_size = os.path.getsize(t_path)
+                    if f_size > transcript_offset:
+                        with open(t_path, "rb") as f:
+                            f.seek(transcript_offset, os.SEEK_SET)
+                            new_data = f.read().decode("utf-8", errors="ignore").lower()
+                        for err_kw in ("resource_exhausted", "exhausted your capacity", "code 429", "quota exceeded", "quota limit"):
+                            if err_kw in new_data:
+                                exhausted = True
+                                break
+                except Exception:
+                    pass
+
+        # 5. Periodically check quota API (every 10 seconds)
+        if not exhausted and (time.time() - last_api_check > 10.0):
+            last_api_check = time.time()
+            try:
+                p_path = os.path.join(get_profiles_dir(), profile)
+                if os.path.isdir(p_path):
+                    meta_cache = load_metadata_cache()
+                    data = fetch_single_profile(profile, p_path, meta_cache, force_refresh=True)
+                    t_pct, _ = score_profile_for_model(data, "Google Gemini", None)
+                    if data.get("authenticated") and not data.get("error") and t_pct <= 0.0:
+                        exhausted = True
+            except Exception:
+                pass
+
+        # 6. If exhausted, write marker and KILL AGY
+        if exhausted:
+            try:
+                with open(marker_file, "w", encoding="utf-8") as f:
+                    f.write(f"{resolved_conv or ''}|{profile}\n")
+            except Exception:
+                pass
+
+            if agy_pid and is_pid_alive(agy_pid):
+                kill_pid_tree(agy_pid)
+            break
+
 def rebind_conversation_trajectory(conv_target, since_epoch=None):
     """
     Rebinds trajectory_meta in SQLite (using the same logic as mgy fork) so a conversation
@@ -1370,6 +1565,7 @@ def rebind_conversation_trajectory(conv_target, since_epoch=None):
 def main():
     parser = argparse.ArgumentParser(description="mgy Quota Dashboard TUI & Profile Selector")
     parser.add_argument("profile", nargs="?", help="Optional specific profile name")
+    parser.add_argument("--profile", dest="profile_flag", type=str, default="", help="Profile name flag")
     parser.add_argument("-w", "--watch", type=int, nargs="?", const=10, help="Live watch mode with refresh interval in seconds")
     parser.add_argument("-c", "--cols", "--columns", type=int, help="Force number of side-by-side columns")
     parser.add_argument("-1", dest="cols_1", action="store_true", help="Display 1 column")
@@ -1389,7 +1585,15 @@ def main():
     parser.add_argument("--rebind", type=str, metavar="CONV_ID_OR_LATEST", help="Rebind trajectory_meta in SQLite for cross-profile resume")
     parser.add_argument("--find-active-conv", action="store_true", help="Print the most recently active top-level conversation ID")
     parser.add_argument("--since", type=float, default=0.0, help="Optional Unix timestamp filter for --rebind and --find-active-conv")
+    parser.add_argument("--monitor-session", action="store_true", help="Run background monitor to kill agy process when quota depletes")
+    parser.add_argument("--parent-pid", type=int, default=0, help="Parent PID to monitor")
     args = parser.parse_args()
+
+    selected_profile = args.profile or args.profile_flag or ""
+
+    if args.monitor_session:
+        monitor_session(selected_profile, args.parent_pid, conv_id=args.conv_id, since_epoch=args.since if args.since > 0 else None)
+        sys.exit(0)
 
     if args.rebind:
         cid = rebind_conversation_trajectory(args.rebind, since_epoch=args.since if args.since > 0 else None)
@@ -1442,18 +1646,19 @@ def main():
 
     show_all = args.all or (os.environ.get("MGY_QUOTA_ALL") in ("1", "true", "TRUE"))
 
+    prof_arg = selected_profile or None
     if args.watch:
         try:
             while True:
                 # Clear terminal screen
                 sys.stdout.write("\033[H\033[2J")
                 sys.stdout.flush()
-                run_dashboard(args.profile, forced_cols, as_json=args.json, force_refresh=args.refresh, show_all=show_all, min_gemini=args.min_gemini)
+                run_dashboard(prof_arg, forced_cols, as_json=args.json, force_refresh=args.refresh, show_all=show_all, min_gemini=args.min_gemini)
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             print("\nExiting watch mode.")
     else:
-        run_dashboard(args.profile, forced_cols, as_json=args.json, force_refresh=args.refresh, show_all=show_all, min_gemini=args.min_gemini)
+        run_dashboard(prof_arg, forced_cols, as_json=args.json, force_refresh=args.refresh, show_all=show_all, min_gemini=args.min_gemini)
 
 if __name__ == "__main__":
     main()
