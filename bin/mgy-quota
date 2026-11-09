@@ -750,40 +750,6 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
             "reset_str": dur_str,
         })
 
-    # Detect Google AI Ultra/Pro account-wide individual weekly quota lockout:
-    # In Google Cloud Code Assist, high-capacity models (Claude, OpenAI, and Gemini 3.8/4) share
-    # an account-level weekly individual subscription quota. When exhausted, Google's runtime gateway
-    # rejects generation requests with HTTP 429: "Individual quota reached. Resets in 96h...".
-    # In fetchAvailableModels, Claude/GPT-OSS models reflect this with 0.0% quota and a multi-day reset (>24h),
-    # while Google's backend has a reporting bug where Gemini's quotaInfo continues reporting 100% on its
-    # 5-hour rolling burst cycle.
-    ext_high_models = [
-        m for m in parsed_models
-        if m.get("provider") in ("Anthropic Claude", "OpenAI")
-    ]
-    weekly_locked = False
-    weekly_reset_str = ""
-    if ext_high_models and all(m.get("pct", 100.0) <= 0.0 for m in ext_high_models):
-        long_term = [m for m in ext_high_models if "h" in m.get("reset_str", "") or "d" in m.get("reset_str", "")]
-        if long_term:
-            weekly_locked = True
-            weekly_reset_str = long_term[0].get("reset_str", "")
-
-    if weekly_locked:
-        result["weekly_locked"] = True
-        result["weekly_reset"] = weekly_reset_str
-        critical_count = 0
-        low_count = 0
-        for m in parsed_models:
-            if is_gemini_min_version(m, (3, 8)):
-                m["pct"] = 0.0
-                m["reset_str"] = weekly_reset_str
-                m["locked"] = True
-            if m["pct"] <= 10.0:
-                critical_count += 1
-            elif m["pct"] <= 30.0:
-                low_count += 1
-
     result["total_models"] = total_models
     result["models"] = parsed_models
     result["critical_count"] = critical_count
@@ -829,8 +795,6 @@ def render_profile_column(data, width=56, min_version_str="3.8", show_all=False)
     if low > 0:
         summary += f"  {YELLOW}● {low} low{RESET}"
     lines.append(summary)
-    if data.get("weekly_locked"):
-        lines.append(f"  {RED}⚠ Weekly limit reached (resets in {data.get('weekly_reset', '')}){RESET}")
     lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
 
     # Group by provider
@@ -1487,7 +1451,7 @@ def monitor_session(profile, parent_pid, conv_id=None, since_epoch=None):
                 if os.path.exists(t_path):
                     transcript_offset = max(0, os.path.getsize(t_path) - 2048)
 
-        # 4. Check transcript.jsonl for quota errors
+        # 4. Check transcript.jsonl and SQLite for actual quota errors
         exhausted = False
         if resolved_conv:
             t_path = os.path.join(source_dir, "brain", resolved_conv, ".system_generated", "logs", "transcript.jsonl")
@@ -1498,28 +1462,17 @@ def monitor_session(profile, parent_pid, conv_id=None, since_epoch=None):
                         with open(t_path, "rb") as f:
                             f.seek(transcript_offset, os.SEEK_SET)
                             new_data = f.read().decode("utf-8", errors="ignore").lower()
-                        for err_kw in ("resource_exhausted", "exhausted your capacity", "code 429", "quota exceeded", "quota limit"):
+                        for err_kw in ("resource_exhausted", "exhausted your capacity", "code 429", "quota exceeded", "quota limit", "individual quota reached"):
                             if err_kw in new_data:
                                 exhausted = True
                                 break
                 except Exception:
                     pass
 
-        # 5. Periodically check quota API (every 10 seconds)
-        if not exhausted and (time.time() - last_api_check > 10.0):
-            last_api_check = time.time()
-            try:
-                p_path = os.path.join(get_profiles_dir(), profile)
-                if os.path.isdir(p_path):
-                    meta_cache = load_metadata_cache()
-                    data = fetch_single_profile(profile, p_path, meta_cache, force_refresh=True)
-                    t_pct, _ = score_profile_for_model(data, "Google Gemini", None)
-                    if data.get("authenticated") and not data.get("error") and t_pct <= 0.0:
-                        exhausted = True
-            except Exception:
-                pass
+            if not exhausted:
+                exhausted = has_recent_quota_error(resolved_conv)
 
-        # 6. If exhausted, write marker and KILL AGY
+        # 5. If exhausted by a real runtime quota error, write marker and KILL AGY
         if exhausted:
             try:
                 with open(marker_file, "w", encoding="utf-8") as f:

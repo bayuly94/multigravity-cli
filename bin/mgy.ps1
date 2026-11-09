@@ -578,16 +578,24 @@ function Show-AllDepletedAlert {
     } catch {}
 }
 
-function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
+function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$AutoFailover = $false) {
     $currentProfile = $ProfileName
     [string[]]$currentArgs = if ($AgyArgs) { $AgyArgs } else { @() }
-    $noFailover = ($env:MGY_NO_FAILOVER -eq "1") -or ($env:MULTIGRAVITY_AUTO_FAILOVER -in @("0", "false", "FALSE"))
-    if ($currentArgs -contains "--no-failover") {
-        $noFailover = $true
+
+    # Auto-failover is ONLY enabled when explicitly invoked via 'mgy auto', 'mgy best',
+    # or when MULTIGRAVITY_AUTO_FAILOVER=1 / --auto-failover flag is passed.
+    # Normal 'mgy <profile>' invocations MUST NOT monitor, kill, or switch profiles.
+    $enableFailover = $AutoFailover -or ($env:MULTIGRAVITY_AUTO_FAILOVER -in @("1", "true", "TRUE"))
+    if ($currentArgs -contains "--auto-failover") {
+        $enableFailover = $true
+        $currentArgs = @($currentArgs | Where-Object { $_ -ne "--auto-failover" })
+    }
+    if ($currentArgs -contains "--no-failover" -or ($env:MGY_NO_FAILOVER -eq "1") -or ($env:MULTIGRAVITY_AUTO_FAILOVER -in @("0", "false", "FALSE"))) {
+        $enableFailover = $false
         $currentArgs = @($currentArgs | Where-Object { $_ -ne "--no-failover" })
     }
     if ($currentArgs -contains "--version" -or $currentArgs -contains "-v" -or $currentArgs -contains "--help" -or $currentArgs -contains "-h") {
-        $noFailover = $true
+        $enableFailover = $false
     }
     $triedProfiles = @($currentProfile)
     $quotaScript = Get-QuotaScriptPath
@@ -671,7 +679,7 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
         $sentinelFile = Join-Path $ProfilesDir ".exhausted_$PID"
         if (Test-Path $sentinelFile) { Remove-Item $sentinelFile -Force -ErrorAction SilentlyContinue }
 
-        if (-not $noFailover -and $quotaScript) {
+        if ($enableFailover -and $quotaScript) {
             try {
                 $monArgs = @($quotaScript, "--monitor-session", "--profile", $currentProfile, "--parent-pid", "$PID", "--since", "$sessionStartEpoch")
                 if ($activeConvId) {
@@ -730,8 +738,8 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
             $env:HOME = $prevHome
         }
 
-        # Process-level quota exhaustion check & automatic session resume on next best profile
-        if (-not $noFailover -and $quotaScript) {
+        # Process-level quota exhaustion check & automatic session resume on next best profile (auto mode only)
+        if ($enableFailover -and $quotaScript) {
             $monitorTriggered = Test-Path $sentinelFile
             if ($monitorTriggered) {
                 try {
@@ -781,11 +789,15 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs) {
                 $nextBest = Select-BestProfile -Exclude ($triedProfiles -join ",") -ModelHint $modelHint
                 if ($nextBest -and $nextBest.Profile) {
                     Write-Host "==> Dynamic Account Switch: Resuming on '$($nextBest.Profile)' [$($nextBest.Tier)] ($($nextBest.Provider): $($nextBest.TargetPct)% available)..." -ForegroundColor Green
-                    Write-Host "==> Reopening conversation '$activeConvId' with prompt:" -ForegroundColor Cyan
-                    Write-Host "    '/goal resume what you were doing before the quota depleted'" -ForegroundColor Cyan
+                    if ($activeConvId) {
+                        Write-Host "==> Reopening conversation '$activeConvId' with prompt:" -ForegroundColor Cyan
+                        Write-Host "    '/goal resume what you were doing before the quota depleted'" -ForegroundColor Cyan
+                        $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId -ResumePrompt "/goal resume what you were doing before the quota depleted"
+                    } else {
+                        Write-Host "==> Starting new session on '$($nextBest.Profile)'..." -ForegroundColor Cyan
+                    }
                     $currentProfile = $nextBest.Profile
                     $triedProfiles += $currentProfile
-                    $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId -ResumePrompt "/goal resume what you were doing before the quota depleted"
                     continue
                 } else {
                     Show-AllDepletedAlert
@@ -1301,7 +1313,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
             exit 1
         }
         Write-Host "==> Selected best profile: '$($best.Profile)' [$($best.Tier)] ($($best.Provider): $($best.TargetPct)% quota available)" -ForegroundColor Green
-        Start-ProfileSession -ProfileName $best.Profile -AgyArgs $RemainingArgs
+        Start-ProfileSession -ProfileName $best.Profile -AgyArgs $RemainingArgs -AutoFailover $true
     }
 
     "resume" {

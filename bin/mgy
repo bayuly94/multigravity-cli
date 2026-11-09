@@ -626,24 +626,32 @@ show_all_depleted_alert() {
 
 start_profile_session() {
     local current_profile="$1"
-    shift
+    local auto_failover="${2:-0}"
+    shift 2
     local current_args=("$@")
-    local no_failover="${MGY_NO_FAILOVER:-0}"
-    if [ "${MULTIGRAVITY_AUTO_FAILOVER:-1}" = "0" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-1}" = "false" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-1}" = "FALSE" ]; then
-        no_failover="1"
+
+    local enable_failover=0
+    if [ "$auto_failover" = "1" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-0}" = "1" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-0}" = "true" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-0}" = "TRUE" ]; then
+        enable_failover=1
     fi
+
     local filtered_init=()
     for a in "${current_args[@]}"; do
-        if [ "$a" = "--no-failover" ]; then
-            no_failover="1"
+        if [ "$a" = "--auto-failover" ]; then
+            enable_failover=1
+        elif [ "$a" = "--no-failover" ]; then
+            enable_failover=0
         else
             case "$a" in
-                --version|-v|--help|-h) no_failover="1" ;;
+                --version|-v|--help|-h) enable_failover=0 ;;
             esac
             filtered_init+=("$a")
         fi
     done
     current_args=("${filtered_init[@]}")
+    if [ "${MGY_NO_FAILOVER:-0}" = "1" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-}" = "0" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-}" = "false" ] || [ "${MULTIGRAVITY_AUTO_FAILOVER:-}" = "FALSE" ]; then
+        enable_failover=0
+    fi
 
     local tried_profiles="$current_profile"
     local qbin
@@ -704,7 +712,7 @@ start_profile_session() {
         local sentinel_file="$PROFILES_DIR/.exhausted_$$"
         rm -f "$sentinel_file" 2>/dev/null || true
         local monitor_pid=""
-        if [ "$no_failover" != "1" ] && [ -n "$qbin" ]; then
+        if [ "$enable_failover" = "1" ] && [ -n "$qbin" ]; then
             local mon_args=("$qbin" "--monitor-session" "--profile" "$current_profile" "--parent-pid" "$$" "--since" "$session_start_epoch")
             [ -n "$active_conv_id" ] && mon_args+=("--conv-id" "$active_conv_id")
             python3 "${mon_args[@]}" >/dev/null 2>&1 &
@@ -719,7 +727,7 @@ start_profile_session() {
 
         [ -n "$monitor_pid" ] && kill -9 "$monitor_pid" 2>/dev/null || true
 
-        if [ "$no_failover" != "1" ] && [ -n "$qbin" ]; then
+        if [ "$enable_failover" = "1" ] && [ -n "$qbin" ]; then
             local is_exhausted=0
             local ex_pct="0.0"
             local ex_prov="Google Gemini"
@@ -765,8 +773,12 @@ start_profile_session() {
                     local next_prof next_tier next_pct _ next_prov
                     IFS='|' read -r next_prof next_tier next_pct _ next_prov <<< "$next_detail"
                     echo "==> Dynamic Account Switch: Resuming on '$next_prof' [$next_tier] ($next_prov: ${next_pct}% available)..."
-                    echo "==> Reopening conversation '$active_conv_id' with prompt:"
-                    echo "    '/goal resume what you were doing before the quota depleted'"
+                    if [ -n "$active_conv_id" ]; then
+                        echo "==> Reopening conversation '$active_conv_id' with prompt:"
+                        echo "    '/goal resume what you were doing before the quota depleted'"
+                    else
+                        echo "==> Starting fresh session on '$next_prof'..."
+                    fi
                     current_profile="$next_prof"
                     tried_profiles="${tried_profiles},${current_profile}"
 
@@ -789,7 +801,11 @@ start_profile_session() {
                     done
                     local p_flag="-i"
                     [ "$is_print" -eq 1 ] && p_flag="-p"
-                    current_args=("--conversation" "$active_conv_id" "$p_flag" "/goal resume what you were doing before the quota depleted" "${failover_args[@]}")
+                    if [ -n "$active_conv_id" ]; then
+                        current_args=("--conversation" "$active_conv_id" "$p_flag" "/goal resume what you were doing before the quota depleted" "${failover_args[@]}")
+                    else
+                        current_args=("${failover_args[@]}")
+                    fi
                     continue
                 else
                     show_all_depleted_alert
@@ -1130,7 +1146,7 @@ EOF
         fi
         IFS='|' read -r best_profile best_tier best_pct _ best_prov <<< "$best_detail"
         echo "==> Selected best profile: '$best_profile' [$best_tier] ($best_prov: ${best_pct}% quota available)"
-        start_profile_session "$best_profile" "$@"
+        start_profile_session "$best_profile" 1 "$@"
         exit $?
         ;;
 
@@ -1167,7 +1183,7 @@ EOF
             echo "==> Selected best profile: '$target_prof' [$best_tier] ($best_prov: ${best_pct}% quota available)"
         fi
 
-        start_profile_session "$target_prof" "${resume_args[@]}"
+        start_profile_session "$target_prof" 1 "${resume_args[@]}"
         exit $?
         ;;
 
@@ -1196,7 +1212,7 @@ EOF
                 fi
             fi
         fi
-        start_profile_session "$SELECTED_PROFILE" "$@"
+        start_profile_session "$SELECTED_PROFILE" 0 "$@"
         exit $?
         ;;
 
@@ -1206,7 +1222,7 @@ EOF
             echo "Error: profile '$1' does not exist. Create it first using: $CMD_NAME new $1"
             exit 1
         fi
-        start_profile_session "$1" "${@:2}"
+        start_profile_session "$1" 0 "${@:2}"
         exit $?
         ;;
 esac
