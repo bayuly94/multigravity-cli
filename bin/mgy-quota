@@ -221,6 +221,10 @@ MODEL_DISPLAY_NAMES = {
     "gemini-3.6-flash-tiered": "Gemini 3.6 Flash (High)",
     "gemini-3.7-flash-tiered": "Gemini 3.7 Flash (High)",
     "gemini-3.8-flash-tiered": "Gemini 3.8 Flash (High)",
+    "gemini-4-argon-high": "Gemini 4 Argon (High)",
+    "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
+    "gemini-4-argon-low": "Gemini 4 Argon (Low)",
+    "gemini-4-argon": "Gemini 4 Argon",
     "chat_20706": "Chat Model 20706",
     "chat_23310": "Chat Model 23310",
     "tab_flash_lite_preview": "Tab Flash Lite (Prev)",
@@ -746,6 +750,40 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
             "reset_str": dur_str,
         })
 
+    # Detect Google AI Ultra/Pro account-wide individual weekly quota lockout:
+    # In Google Cloud Code Assist, high-capacity models (Claude, OpenAI, and Gemini 3.8/4) share
+    # an account-level weekly individual subscription quota. When exhausted, Google's runtime gateway
+    # rejects generation requests with HTTP 429: "Individual quota reached. Resets in 96h...".
+    # In fetchAvailableModels, Claude/GPT-OSS models reflect this with 0.0% quota and a multi-day reset (>24h),
+    # while Google's backend has a reporting bug where Gemini's quotaInfo continues reporting 100% on its
+    # 5-hour rolling burst cycle.
+    ext_high_models = [
+        m for m in parsed_models
+        if m.get("provider") in ("Anthropic Claude", "OpenAI")
+    ]
+    weekly_locked = False
+    weekly_reset_str = ""
+    if ext_high_models and all(m.get("pct", 100.0) <= 0.0 for m in ext_high_models):
+        long_term = [m for m in ext_high_models if "h" in m.get("reset_str", "") or "d" in m.get("reset_str", "")]
+        if long_term:
+            weekly_locked = True
+            weekly_reset_str = long_term[0].get("reset_str", "")
+
+    if weekly_locked:
+        result["weekly_locked"] = True
+        result["weekly_reset"] = weekly_reset_str
+        critical_count = 0
+        low_count = 0
+        for m in parsed_models:
+            if is_gemini_min_version(m, (3, 8)):
+                m["pct"] = 0.0
+                m["reset_str"] = weekly_reset_str
+                m["locked"] = True
+            if m["pct"] <= 10.0:
+                critical_count += 1
+            elif m["pct"] <= 30.0:
+                low_count += 1
+
     result["total_models"] = total_models
     result["models"] = parsed_models
     result["critical_count"] = critical_count
@@ -791,6 +829,8 @@ def render_profile_column(data, width=56, min_version_str="3.8", show_all=False)
     if low > 0:
         summary += f"  {YELLOW}● {low} low{RESET}"
     lines.append(summary)
+    if data.get("weekly_locked"):
+        lines.append(f"  {RED}⚠ Weekly limit reached (resets in {data.get('weekly_reset', '')}){RESET}")
     lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
 
     # Group by provider
@@ -1256,6 +1296,7 @@ def has_recent_quota_error(conv_id):
         "quota limit",
         "rate limit",
         "too many requests",
+        "individual quota reached",
     )
 
     # 1. Check transcript.jsonl tail if present
@@ -1274,21 +1315,22 @@ def has_recent_quota_error(conv_id):
         except Exception:
             pass
 
-    # 2. Check last 5 steps in SQLite conversation DB
+    # 2. Check last 5 steps in SQLite conversation DB (error_details and step_payload)
     db_path = os.path.join(source_dir, "conversations", f"{conv_id}.db")
     if os.path.exists(db_path):
         try:
             import sqlite3
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
             rows = conn.execute(
-                "SELECT error_details FROM steps ORDER BY idx DESC LIMIT 5"
+                "SELECT error_details, step_payload FROM steps ORDER BY idx DESC LIMIT 5"
             ).fetchall()
             conn.close()
-            for (err_blob,) in rows:
-                if err_blob:
-                    text = (err_blob.decode("utf-8", errors="ignore") if isinstance(err_blob, bytes) else str(err_blob)).lower()
-                    if any(k in text for k in keywords):
-                        return True
+            for (err_blob, payload_blob) in rows:
+                for b in (err_blob, payload_blob):
+                    if b:
+                        text = (b.decode("utf-8", errors="ignore") if isinstance(b, bytes) else str(b)).lower()
+                        if any(k in text for k in keywords):
+                            return True
         except Exception:
             pass
 
