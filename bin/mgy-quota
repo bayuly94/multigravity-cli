@@ -218,9 +218,9 @@ PROVIDER_ICONS = {
 PROVIDER_ORDER = ["Anthropic Claude", "Google Gemini", "OpenAI", "Other"]
 
 MODEL_DISPLAY_NAMES = {
-    "gemini-3.6-flash-tiered": "Placeholder M196",
-    "gemini-3.7-flash-tiered": "Placeholder M301",
-    "gemini-3.8-flash-tiered": "Placeholder M322",
+    "gemini-3.6-flash-tiered": "Gemini 3.6 Flash (High)",
+    "gemini-3.7-flash-tiered": "Gemini 3.7 Flash (High)",
+    "gemini-3.8-flash-tiered": "Gemini 3.8 Flash (High)",
     "chat_20706": "Chat Model 20706",
     "chat_23310": "Chat Model 23310",
     "tab_flash_lite_preview": "Tab Flash Lite (Prev)",
@@ -391,7 +391,25 @@ def get_profile_raw_credential(name, profile_path):
 
     return None
 
-def get_provider(name):
+def get_provider(name, model_id="", mdata=None):
+    if mdata:
+        api_prov = mdata.get("apiProvider", "")
+        model_prov = mdata.get("modelProvider", "")
+        if "GOOGLE" in api_prov or "GOOGLE" in model_prov:
+            return "Google Gemini"
+        if "ANTHROPIC" in api_prov or "ANTHROPIC" in model_prov:
+            return "Anthropic Claude"
+        if "OPENAI" in api_prov or "OPENAI" in model_prov:
+            return "OpenAI"
+
+    mid_lower = (model_id or "").lower()
+    if mid_lower.startswith("gemini-") or "gemini" in mid_lower:
+        return "Google Gemini"
+    if mid_lower.startswith("claude-") or "claude" in mid_lower:
+        return "Anthropic Claude"
+    if mid_lower.startswith("gpt-") or "gpt" in mid_lower or "oss" in mid_lower:
+        return "OpenAI"
+
     if name.startswith("Claude") or "Anthropic" in name:
         return "Anthropic Claude"
     if name.startswith("Gemini") or "Google" in name:
@@ -399,6 +417,48 @@ def get_provider(name):
     if name.startswith("GPT") or name.startswith("OSS") or "OpenAI" in name:
         return "OpenAI"
     return "Other"
+
+def parse_gemini_version(model_id, model_name=""):
+    """Extracts (major, minor) tuple from a Gemini model ID or display name."""
+    for text in (model_id, model_name):
+        if not text:
+            continue
+        m = re.search(r'gemini[- ]+(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+        if m:
+            v_str = m.group(1)
+            parts = v_str.split(".")
+            try:
+                major = int(parts[0])
+                minor = int(parts[1]) if len(parts) > 1 else 0
+                return (major, minor)
+            except ValueError:
+                pass
+        m2 = re.match(r'^(\d+(?:\.\d+)?)', text.strip())
+        if m2:
+            v_str = m2.group(1)
+            parts = v_str.split(".")
+            try:
+                major = int(parts[0])
+                minor = int(parts[1]) if len(parts) > 1 else 0
+                return (major, minor)
+            except ValueError:
+                pass
+    return None
+
+def is_gemini_min_version(model_dict, min_version=(3, 8)):
+    """Returns True if the model is a Google Gemini model with version >= min_version."""
+    provider = model_dict.get("provider", "")
+    mid = (model_dict.get("id") or "").lower()
+    name = (model_dict.get("name") or "").lower()
+
+    # Exclude non-Gemini models (Claude, OpenAI, Other)
+    if provider != "Google Gemini" and not mid.startswith("gemini") and not name.startswith("gemini"):
+        return False
+
+    ver = parse_gemini_version(mid, name)
+    if ver is None:
+        return False
+    return ver >= min_version
 
 def get_tier_label(tier_id):
     if not tier_id:
@@ -640,7 +700,13 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
     total_models = len(items)
 
     for mid, mdata in items:
-        display_name = mdata.get("displayName") or MODEL_DISPLAY_NAMES.get(mid) or mid
+        display_name = mdata.get("displayName") or MODEL_DISPLAY_NAMES.get(mid)
+        if not display_name:
+            if mid.startswith("gemini-"):
+                clean = mid.replace("-tiered", " (High)").replace("-", " ")
+                display_name = " ".join(word.capitalize() if word.lower() not in ("flash", "pro", "lite", "high") else word.title() for word in clean.split())
+            else:
+                display_name = mid
         quota_info = mdata.get("quotaInfo") or {}
         reset_str = quota_info.get("resetTime")
 
@@ -675,7 +741,7 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
         parsed_models.append({
             "id": mid,
             "name": display_name,
-            "provider": get_provider(display_name),
+            "provider": get_provider(display_name, mid, mdata),
             "pct": rem_pct,
             "reset_str": dur_str,
         })
@@ -686,7 +752,7 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
     result["low_count"] = low_count
     return result
 
-def render_profile_column(data, width=56):
+def render_profile_column(data, width=56, min_version_str="3.8", show_all=False):
     """Renders a single profile's quota dashboard into a list of strings."""
     lines = []
     name = data["profile"]
@@ -697,7 +763,10 @@ def render_profile_column(data, width=56):
     low = data.get("low_count", 0)
 
     lines.append("")
-    lines.append(f"  {BOLD}{CYAN}QUOTA DASHBOARD{RESET}")
+    if show_all:
+        lines.append(f"  {BOLD}{CYAN}QUOTA DASHBOARD{RESET}")
+    else:
+        lines.append(f"  {BOLD}{CYAN}QUOTA DASHBOARD{RESET} {DIM}(Gemini {min_version_str}+){RESET}")
     lines.append(f"  {DIM}{name} [{tier}]{RESET}")
     lines.append("")
 
@@ -707,7 +776,16 @@ def render_profile_column(data, width=56):
         lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
         return lines
 
-    summary = f"  {DIM}{total} models{RESET}"
+    if not models:
+        lines.append(f"  {DIM}0 models{RESET}")
+        lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
+        lines.append("")
+        tag = f"Gemini {min_version_str}+" if not show_all else "quota"
+        lines.append(f"  {DIM}(no {tag} models found){RESET}")
+        lines.append("")
+        return lines
+
+    summary = f"  {DIM}{total} model{'s' if total != 1 else ''}{RESET}"
     if crit > 0:
         summary += f"  {RED}● {crit} critical{RESET}"
     if low > 0:
@@ -857,7 +935,7 @@ def render_side_by_side(all_columns, term_width, col_width=56, forced_cols=None)
 
     return "\n".join(output_lines)
 
-def run_dashboard(selected_profile=None, forced_cols=None, as_json=False, force_refresh=False):
+def run_dashboard(selected_profile=None, forced_cols=None, as_json=False, force_refresh=False, show_all=False, min_gemini="3.8"):
     profiles_dir = get_profiles_dir()
     if not os.path.exists(profiles_dir):
         print(f"No profiles found in {profiles_dir}")
@@ -902,6 +980,24 @@ def run_dashboard(selected_profile=None, forced_cols=None, as_json=False, force_
     except Exception:
         pass
 
+    # Filter models if not show_all
+    min_ver_tuple = (3, 8)
+    if min_gemini:
+        parts = min_gemini.split(".")
+        try:
+            min_ver_tuple = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+        except ValueError:
+            min_ver_tuple = (3, 8)
+
+    if not show_all:
+        for r in results:
+            if r.get("models"):
+                filtered = [m for m in r["models"] if is_gemini_min_version(m, min_ver_tuple)]
+                r["models"] = filtered
+                r["total_models"] = len(filtered)
+                r["critical_count"] = sum(1 for m in filtered if m["pct"] <= 10.0)
+                r["low_count"] = sum(1 for m in filtered if 10.0 < m["pct"] <= 30.0)
+
     # Maintain original sorted order
     name_order = {name: i for i, (name, _) in enumerate(targets)}
     results.sort(key=lambda x: name_order.get(x["profile"], 0))
@@ -911,7 +1007,7 @@ def run_dashboard(selected_profile=None, forced_cols=None, as_json=False, force_
         return
 
     col_width = 56
-    rendered_cols = [render_profile_column(r, col_width) for r in results]
+    rendered_cols = [render_profile_column(r, col_width, min_version_str=min_gemini, show_all=show_all) for r in results]
 
     term_width = get_terminal_width()
     print(render_side_by_side(rendered_cols, term_width, col_width, forced_cols))
@@ -956,18 +1052,38 @@ def score_profile_for_model(profile_data, target_provider, target_model=None):
     target_pct = None
 
     if target_model:
-        tm_lower = target_model.lower()
+        tm_lower = target_model.lower().strip()
         for m in models:
             if m["id"].lower() == tm_lower or m["name"].lower() == tm_lower:
                 target_pct = m["pct"]
                 break
+        if target_pct is None:
+            for m in models:
+                if tm_lower in m["id"].lower() or tm_lower in m["name"].lower():
+                    target_pct = m["pct"]
+                    break
+        if target_pct is None:
+            t_ver = parse_gemini_version(tm_lower, tm_lower)
+            if t_ver:
+                for m in models:
+                    if parse_gemini_version(m["id"], m["name"]) == t_ver:
+                        target_pct = m["pct"]
+                        break
 
     if target_pct is None:
         prov_models = [m for m in models if m["provider"] == target_provider]
         if not prov_models and target_provider == "Google Gemini":
             prov_models = [m for m in models if m["provider"] in ("Google Gemini", "Other")]
+
         if prov_models:
-            target_pct = sum(m["pct"] for m in prov_models) / len(prov_models)
+            if target_provider == "Google Gemini":
+                gem_38 = [m for m in prov_models if is_gemini_min_version(m, (3, 8))]
+                if gem_38:
+                    target_pct = sum(m["pct"] for m in gem_38) / len(gem_38)
+                else:
+                    target_pct = sum(m["pct"] for m in prov_models) / len(prov_models)
+            else:
+                target_pct = sum(m["pct"] for m in prov_models) / len(prov_models)
         else:
             target_pct = overall_pct
 
@@ -1261,6 +1377,8 @@ def main():
     parser.add_argument("-3", dest="cols_3", action="store_true", help="Display 3 columns side-by-side")
     parser.add_argument("-4", dest="cols_4", action="store_true", help="Display 4 columns side-by-side")
     parser.add_argument("-r", "--refresh", "--force-refresh", action="store_true", help="Force fresh retrieval of subscription tiers & models")
+    parser.add_argument("-a", "--all", "--all-models", action="store_true", help="Display quotas for all models (including Claude, OpenAI, and older Gemini)")
+    parser.add_argument("--min-gemini", type=str, default="3.8", help="Minimum Gemini version to display (default: 3.8)")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     parser.add_argument("--best", action="store_true", help="Select and print the profile with the highest remaining quota")
     parser.add_argument("--best-format", choices=["name", "detail", "json"], default="name", help="Output format for --best")
@@ -1322,18 +1440,20 @@ def main():
     elif args.cols_3: forced_cols = 3
     elif args.cols_4: forced_cols = 4
 
+    show_all = args.all or (os.environ.get("MGY_QUOTA_ALL") in ("1", "true", "TRUE"))
+
     if args.watch:
         try:
             while True:
                 # Clear terminal screen
                 sys.stdout.write("\033[H\033[2J")
                 sys.stdout.flush()
-                run_dashboard(args.profile, forced_cols, as_json=args.json, force_refresh=args.refresh)
+                run_dashboard(args.profile, forced_cols, as_json=args.json, force_refresh=args.refresh, show_all=show_all, min_gemini=args.min_gemini)
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             print("\nExiting watch mode.")
     else:
-        run_dashboard(args.profile, forced_cols, as_json=args.json, force_refresh=args.refresh)
+        run_dashboard(args.profile, forced_cols, as_json=args.json, force_refresh=args.refresh, show_all=show_all, min_gemini=args.min_gemini)
 
 if __name__ == "__main__":
     main()

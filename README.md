@@ -169,14 +169,20 @@ mgy <profile> -p "Explain distributed locks in Go"
 
 ### 4. Checking Quotas Across All Accounts
 
-`mgy` features a built-in, multi-column **Quota Dashboard TUI** that queries the Antigravity API in parallel and displays quotas across all your profiles with live countdowns, progress bars, and critical alerts:
+`mgy` features a built-in, multi-column **Quota Dashboard TUI** that queries the Antigravity API in parallel and displays quotas across all your profiles with live countdowns, progress bars, and critical alerts.
+
+By default, `mgy quotas` displays **Gemini 3.8 and above** quotas (filtering out Claude, OpenAI, and older Gemini models for maximum speed and focus):
 
 ```bash
-# View dashboard for all profiles (auto-formats side-by-side on wide terminals)
+# View dashboard for all profiles (defaults to Gemini 3.8+):
 mgy quotas
 
 # Inspect quota for a single profile:
 mgy quotas <profile_name>
+
+# View ALL models (including Anthropic Claude, OpenAI, and older Gemini models):
+mgy quotas -a
+mgy quotas --all
 
 # Live watch mode with auto-refresh (e.g. every 30s):
 mgy quotas -w 30
@@ -184,29 +190,14 @@ mgy quotas -w 30
 
 **Dashboard Preview:**
 ```text
-  QUOTA DASHBOARD                                                 │   QUOTA DASHBOARD                                                 
-  <profile_1> [PRO]                                               │   <profile_2> [PRO]                                                 
-                                                                  │                                                                   
-  23 models                                                       │   23 models                                                       
-  ──────────────────────────────────────────────────────────────│   ──────────────────────────────────────────────────────────────  
-                                                                  │                                                                   
-  ◇ Anthropic Claude                                              │   ◇ Anthropic Claude                                              
-    Opus 4.6 (Thinking)    ━━━━━━━━━━ 100.0%   4h 59m             │     Opus 4.6 (Thinking)    ━━━━━━━━━━ 100.0%   4h 59m             
-    Sonnet 4.6 (Thinking)  ━━━━━━━━━━ 100.0%   4h 59m             │     Sonnet 4.6 (Thinking)  ━━━━━━━━━━ 100.0%   4h 59m             
-                                                                  │                                                                   
-  ◆ Google Gemini                                                 │   ◆ Google Gemini                                                 
-    2.5 Pro                ━━━━━━━━━━ 100.0%  21h 43m             │     2.5 Pro                ━━━━━━━━━━ 100.0%  21h 43m             
-    3 Flash                ━━━━━━━━━━ 100.0%  21h 43m             │     3 Flash                ━━━━━━━━━━ 100.0%  21h 43m             
-    3.1 Flash Image        ━━━━━━━━━━ 100.0%  21h 43m             │     3.1 Flash Image        ━━━━━━━━━━ 100.0%  21h 43m             
-    3.1 Pro (High)         ━━━━━━━━━━ 100.0%  21h 43m             │     3.1 Pro (High)         ━━━━━━━━━━ 100.0%  21h 43m             
-    3.5 Flash (Medium)     ━━━━━━━━━━ 100.0%  21h 43m             │     3.5 Flash (Medium)     ━━━━━━━━━━ 100.0%  21h 43m             
-    3.6 Flash (High)       ━━━━━━━━━━ 100.0%  21h 43m             │     3.6 Flash (High)       ━━━━━━━━━━ 100.0%  21h 43m             
-                                                                  │                                                                   
-  ○ OpenAI                                                        │   ○ OpenAI                                                        
-    OSS 120B (Medium)      ━━━━━━━━━━ 100.0%   4h 59m             │     OSS 120B (Medium)      ━━━━━━━━━━ 100.0%   4h 59m             
-                                                                  │                                                                   
-  ◌ Other                                                         │   ◌ Other                                                         
-    Placeholder M196       ━━━━━━━━━━ 100.0%  21h 43m             │     Placeholder M196       ━━━━━━━━━━ 100.0%  21h 43m             
+  QUOTA DASHBOARD (Gemini 3.8+)                                   │   QUOTA DASHBOARD (Gemini 3.8+)
+  <profile_1> [PRO]                                               │   <profile_2> [ULTRA]
+                                                                  │ 
+  1 model                                                         │   1 model
+  ──────────────────────────────────────────────────────────────│   ──────────────────────────────────────────────────────────────
+                                                                  │ 
+  ◆ Google Gemini                                                 │   ◆ Google Gemini
+    3.8 Flash (High)       ━━━━━━━━━━ 100.0%   4h 59m             │     3.8 Flash (High)       ━━━━━━━━━━ 100.0%   4h 59m
 ```
 
 ---
@@ -250,7 +241,7 @@ Both `mgy` and `multigravity` can be used interchangeably:
 | `mgy fork --conversation=<id>`      | Forks an active conversation across all other profiles with fresh IDs.                                                           |
 | `mgy new <profile>`                 | Creates a profile directory and executes the initial OAuth authentication flow.                                                  |
 | `mgy list`                          | Lists all available configured profiles.                                                                                         |
-| `mgy quotas`                        | Iterates across all profiles and outputs active model quotas.                                                                    |
+| `mgy quotas [-a]`                   | Iterates across all profiles and outputs active Gemini 3.8+ quotas (`-a` / `--all` for all models).                              |
 | `mgy delete <profile>`              | Prompts for confirmation and deletes the profile directory.                                                                      |
 | `mgy <profile> [args...]`           | Starts `agy` with the chosen profile, forwarding any arguments (with automatic quota-exhaustion failover on exit).               |
 | `mgy help`, `--help`, `-h`          | Displays the help and usage menu.                                                                                                |
@@ -263,6 +254,7 @@ Both `mgy` and `multigravity` can be used interchangeably:
 | :--------------------------- | :-------------------------------- | :-------------------------------------------------------------------------------- |
 | `MULTIGRAVITY_PROFILES_DIR`  | `~/.config/multigravity-profiles` | Base directory where all isolated profile workspaces are stored.                  |
 | `MULTIGRAVITY_AUTO_FAILOVER` | `1` (enabled)                     | Set to `0` or `false` to disable automatic cross-profile failover on quota limit. |
+| `MGY_QUOTA_ALL`              | `0` (Gemini 3.8+ only)            | Set to `1` or `true` to display all models (including Claude and OpenAI) by default.|
 | `REAL_HOME`                  | `$HOME`                           | Host home directory used for resolving global `.gitconfig` and `.ssh` links.      |
 
 You can override the profiles storage directory by exporting `MULTIGRAVITY_PROFILES_DIR`:

@@ -135,7 +135,7 @@ Commands:
   new <profile>          Create a new isolated profile and authenticate
   import <profile|tar.gz> Import host session into profile OR import conversation archive
   list                   List all existing profiles
-  quotas, quota, quotes  Check model quota usage across all profiles
+  quotas, quota, quotes  Check Gemini 3.8+ quota usage across all profiles (-a for all)
   conversations          List recent conversations and their IDs
   fork --conversation=<id> Fork an existing conversation across all other profiles
   export <conv_id> [tar] Export a conversation into a portable tar.gz archive
@@ -165,7 +165,8 @@ Examples:
   mgy work -c                  # Continue latest chat under profile
   mgy work --conversation=<id> # Resume specific conversation by ID
   mgy conversations            # View list of recent conversation IDs
-  mgy quotas                   # Inspect quotas across all profiles
+  mgy quotas                   # Inspect Gemini 3.8+ quotas across all profiles
+  mgy quotas -a                # Inspect all models (including Claude and OpenAI)
 "@
 }
 
