@@ -734,6 +734,14 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$A
                     }
                 }
             }
+
+            # Inspect session outcome and record quota lockout if exhausted during this run
+            if ($quotaScript) {
+                try {
+                    & python $quotaScript --record-lockout $currentProfile 2>$null | Out-Null
+                } catch {}
+            }
+
             $env:USERPROFILE = $prevUserProfile
             $env:HOME = $prevHome
         }

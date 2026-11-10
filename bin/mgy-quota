@@ -504,7 +504,226 @@ def get_color(pct):
         return YELLOW
     return GREEN
 
-def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=False):
+def parse_delay_str(s):
+    if not s:
+        return 0
+    m = re.match(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', s)
+    if not m:
+        return 0
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    secs = int(m.group(3) or 0)
+    return h * 3600 + mins * 60 + secs
+
+def get_active_lockouts():
+    """
+    Scans recent CLI logs and per-profile lockout caches to detect account-level weekly
+    individual subscription limits (HTTP 429 RESOURCE_EXHAUSTED / Individual quota reached).
+    Returns dict mapping account_email/profile_name -> { email, unlock_time, rem_sec, rem_str, reason }.
+    """
+    now = time.time()
+    log_dir = os.path.join(get_real_home(), ".gemini", "antigravity-cli", "log")
+    lockouts = {}
+    cutoff = now - 8 * 86400
+
+    if os.path.exists(log_dir):
+        glob_logs = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.startswith("cli-") and f.endswith(".log")]
+        glob_logs.sort(key=os.path.getmtime, reverse=True)
+
+        for l in glob_logs:
+            try:
+                mtime = os.path.getmtime(l)
+                if mtime < cutoff:
+                    break
+                f_size = os.path.getsize(l)
+                with open(l, "r", encoding="utf-8", errors="ignore") as f:
+                    if f_size > 512 * 1024:
+                        f.seek(max(0, f_size - 256 * 1024))
+                        content = f.read()
+                    else:
+                        content = f.read()
+            except Exception:
+                continue
+
+            if "RESOURCE_EXHAUSTED" in content or "Individual quota reached" in content:
+                if "applyAuthResult" not in content and f_size > 512 * 1024:
+                    try:
+                        with open(l, "r", encoding="utf-8", errors="ignore") as f:
+                            head_content = f.read(64 * 1024)
+                        em_m = re.search(r'applyAuthResult:\s*email=([^\s,]+)', head_content) or re.search(r'authenticated successfully as ([^\s,]+)', head_content)
+                    except Exception:
+                        em_m = None
+                else:
+                    em_m = re.search(r'applyAuthResult:\s*email=([^\s,]+)', content) or re.search(r'authenticated successfully as ([^\s,]+)', content)
+                email = em_m.group(1) if em_m else None
+
+                reset_m = re.search(r'Resets in ([0-9]+h[0-9]+m[0-9]+s)', content)
+                reset_str = reset_m.group(1) if reset_m else None
+                ts_m = re.search(r'"quotaResetTimeStamp"\s*:\s*"([^"]+)"', content)
+                reset_ts = ts_m.group(1) if ts_m else None
+
+                unlock_time = None
+                if reset_ts:
+                    try:
+                        dt = datetime.fromisoformat(reset_ts.replace("Z", "+00:00"))
+                        unlock_time = dt.timestamp()
+                    except Exception:
+                        pass
+                if not unlock_time and reset_str:
+                    delay_sec = parse_delay_str(reset_str)
+                    unlock_time = mtime + delay_sec
+
+                if email and unlock_time and (unlock_time > now):
+                    if email not in lockouts or unlock_time > lockouts[email]["unlock_time"]:
+                        lockouts[email] = {
+                            "email": email,
+                            "unlock_time": unlock_time,
+                            "rem_sec": unlock_time - now,
+                            "rem_str": format_duration(unlock_time - now),
+                            "reason": "Individual quota reached"
+                        }
+
+    # Inspect and sync per-profile quota_lockout.json
+    profiles_dir = get_profiles_dir()
+    if os.path.exists(profiles_dir):
+        for p in os.listdir(profiles_dir):
+            p_dir = os.path.join(profiles_dir, p)
+            if not os.path.isdir(p_dir):
+                continue
+            p_email = None
+            cred_file = os.path.join(p_dir, ".tokens", "credential.txt")
+            if os.path.exists(cred_file):
+                try:
+                    with open(cred_file, "r", encoding="utf-8") as cf:
+                        cdata = json.load(cf)
+                    p_email = cdata.get("id_token_email") or cdata.get("email")
+                except Exception:
+                    pass
+
+            lockout_file = os.path.join(p_dir, ".tokens", "quota_lockout.json")
+            if os.path.exists(lockout_file):
+                try:
+                    with open(lockout_file, "r", encoding="utf-8") as lf:
+                        ldata = json.load(lf)
+                    u_time = ldata.get("unlock_time", 0)
+                    if u_time > now:
+                        em = ldata.get("email") or p_email or p
+                        if em:
+                            lockouts[em] = {
+                                "email": em,
+                                "unlock_time": u_time,
+                                "rem_sec": u_time - now,
+                                "rem_str": format_duration(u_time - now),
+                                "reason": ldata.get("reason", "Individual quota reached")
+                            }
+                    else:
+                        os.remove(lockout_file)
+                except Exception:
+                    pass
+
+            if p_email and p_email in lockouts:
+                lockouts[p] = lockouts[p_email]
+                try:
+                    os.makedirs(os.path.join(p_dir, ".tokens"), exist_ok=True)
+                    with open(lockout_file, "w", encoding="utf-8") as lf:
+                        json.dump({
+                            "email": p_email,
+                            "profile": p,
+                            "unlock_time": lockouts[p_email]["unlock_time"],
+                            "rem_str": lockouts[p_email]["rem_str"],
+                            "reason": lockouts[p_email]["reason"],
+                            "updated_at": now
+                        }, lf, indent=2)
+                except Exception:
+                    pass
+
+    return lockouts
+
+def record_profile_lockout(profile_name):
+    """
+    Inspects recent logs and conversation DB for an error on profile_name,
+    and immediately persists quota_lockout.json in the profile's directory.
+    """
+    profiles_dir = get_profiles_dir()
+    p_dir = os.path.join(profiles_dir, profile_name)
+    if not os.path.isdir(p_dir):
+        return False
+
+    p_email = None
+    cred_file = os.path.join(p_dir, ".tokens", "credential.txt")
+    if os.path.exists(cred_file):
+        try:
+            with open(cred_file, "r", encoding="utf-8") as cf:
+                cdata = json.load(cf)
+            p_email = cdata.get("id_token_email") or cdata.get("email")
+        except Exception:
+            pass
+
+    lockouts = get_active_lockouts()
+    target_lock = lockouts.get(p_email) or lockouts.get(profile_name)
+
+    if not target_lock:
+        source_dir = os.path.join(get_real_home(), ".gemini", "antigravity-cli")
+        conv_dir = os.path.join(source_dir, "conversations")
+        if os.path.exists(conv_dir):
+            import sqlite3
+            dbs = [os.path.join(conv_dir, f) for f in os.listdir(conv_dir) if f.endswith(".db")]
+            dbs.sort(key=os.path.getmtime, reverse=True)
+            for db in dbs[:5]:
+                try:
+                    conn = sqlite3.connect(db)
+                    cur = conn.cursor()
+                    cur.execute("SELECT step_payload FROM steps ORDER BY idx DESC LIMIT 5")
+                    for row in cur.fetchall():
+                        payload = row[0]
+                        if payload and (b"RESOURCE_EXHAUSTED" in payload or b"Individual quota reached" in payload):
+                            s = payload.decode("latin1", errors="ignore")
+                            ts_m = re.search(r'"quotaResetTimeStamp"\s*:\s*"([^"]+)"', s)
+                            del_m = re.search(r'"quotaResetDelay"\s*:\s*"([^"]+)"', s)
+                            u_time = None
+                            if ts_m:
+                                try:
+                                    dt = datetime.fromisoformat(ts_m.group(1).replace("Z", "+00:00"))
+                                    u_time = dt.timestamp()
+                                except Exception:
+                                    pass
+                            if not u_time and del_m:
+                                u_time = os.path.getmtime(db) + parse_delay_str(del_m.group(1))
+                            if u_time and u_time > time.time():
+                                target_lock = {
+                                    "email": p_email or profile_name,
+                                    "unlock_time": u_time,
+                                    "rem_sec": u_time - time.time(),
+                                    "rem_str": format_duration(u_time - time.time()),
+                                    "reason": "Individual quota reached"
+                                }
+                                break
+                    conn.close()
+                    if target_lock:
+                        break
+                except Exception:
+                    pass
+
+    if target_lock:
+        lockout_file = os.path.join(p_dir, ".tokens", "quota_lockout.json")
+        try:
+            os.makedirs(os.path.join(p_dir, ".tokens"), exist_ok=True)
+            with open(lockout_file, "w", encoding="utf-8") as lf:
+                json.dump({
+                    "email": p_email or profile_name,
+                    "profile": profile_name,
+                    "unlock_time": target_lock["unlock_time"],
+                    "rem_str": target_lock["rem_str"],
+                    "reason": target_lock["reason"],
+                    "updated_at": time.time()
+                }, lf, indent=2)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=False, active_lockouts=None):
     result = {
         "profile": name,
         "authenticated": False,
@@ -533,6 +752,7 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
         access_token = tok.get("access_token")
         refresh_token = tok.get("refresh_token")
         expiry_str = tok.get("expiry")
+        prof_email = payload.get("id_token_email") or payload.get("email") or (tok.get("email") if isinstance(tok, dict) else None)
     except Exception as e:
         result["error"] = f"Failed to parse token: {e}"
         return result
@@ -708,11 +928,40 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
     raw_models = res2.get("models", {}) if res2 else {}
     now_utc = datetime.now(timezone.utc)
 
-    # Parse retrieveUserQuotaSummary to detect account-level weekly subscription limits
-    user_quota_summary = res_uqs.get("groups", []) if isinstance(res_uqs, dict) else []
+    # Check gateway lockouts (HTTP 429 RESOURCE_EXHAUSTED / Individual quota reached)
+    if active_lockouts is None:
+        active_lockouts = get_active_lockouts()
+
+    lock_info = (active_lockouts.get(prof_email) if prof_email else None) or active_lockouts.get(name)
+    if not lock_info:
+        lockout_file = os.path.join(profile_path, ".tokens", "quota_lockout.json")
+        if os.path.exists(lockout_file):
+            try:
+                with open(lockout_file, "r", encoding="utf-8") as lf:
+                    ldata = json.load(lf)
+                u_time = ldata.get("unlock_time", 0)
+                if u_time > time.time():
+                    lock_info = {
+                        "unlock_time": u_time,
+                        "rem_str": format_duration(u_time - time.time()),
+                        "reason": ldata.get("reason", "Individual quota reached")
+                    }
+                else:
+                    os.remove(lockout_file)
+            except Exception:
+                pass
+
     weekly_limit_depleted = False
     weekly_limit_pct = 100.0
     weekly_reset_str = ""
+
+    if lock_info:
+        weekly_limit_depleted = True
+        weekly_limit_pct = 0.0
+        weekly_reset_str = lock_info.get("rem_str", "")
+
+    # Parse retrieveUserQuotaSummary to detect account-level weekly subscription limits
+    user_quota_summary = res_uqs.get("groups", []) if isinstance(res_uqs, dict) else []
 
     for grp in user_quota_summary:
         for bkt in grp.get("buckets", []):
@@ -725,7 +974,7 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
                     weekly_limit_pct = min(weekly_limit_pct, float(rem_frac) * 100.0)
                 if rem_frac == 0 or rem_frac is None:
                     weekly_limit_depleted = True
-                if r_str:
+                if r_str and not weekly_reset_str:
                     try:
                         dt = datetime.fromisoformat(r_str.replace("Z", "+00:00"))
                         diff = (dt - now_utc).total_seconds()
@@ -1025,11 +1274,12 @@ def run_dashboard(selected_profile=None, forced_cols=None, as_json=False, force_
     metadata_cache = load_metadata_cache()
 
     # Fetch data in parallel across all profiles (network I/O releases GIL; up to 24 concurrent workers)
+    active_lockouts = get_active_lockouts()
     results = []
     worker_count = max(1, min(len(targets), 24))
     with ThreadPoolExecutor(max_workers=worker_count) as ex:
         futs = {
-            ex.submit(fetch_single_profile, name, path, metadata_cache, force_refresh): name
+            ex.submit(fetch_single_profile, name, path, metadata_cache, force_refresh, active_lockouts): name
             for name, path in targets
         }
         for fut in as_completed(futs):
@@ -1172,11 +1422,12 @@ def select_best_profile(exclude_profiles=None, model_hint=None, force_refresh=Fa
         return None
 
     metadata_cache = load_metadata_cache()
+    active_lockouts = get_active_lockouts()
     results = []
     worker_count = max(1, min(len(targets), 24))
     with ThreadPoolExecutor(max_workers=worker_count) as ex:
         futs = {
-            ex.submit(fetch_single_profile, name, path, metadata_cache, force_refresh): name
+            ex.submit(fetch_single_profile, name, path, metadata_cache, force_refresh, active_lockouts): name
             for name, path in targets
         }
         for fut in as_completed(futs):
@@ -1532,6 +1783,10 @@ def monitor_session(profile, parent_pid, conv_id=None, since_epoch=None):
         # 5. If exhausted by a real runtime quota error, write marker and KILL AGY
         if exhausted:
             try:
+                record_profile_lockout(profile)
+            except Exception:
+                pass
+            try:
                 with open(marker_file, "w", encoding="utf-8") as f:
                     f.write(f"{resolved_conv or ''}|{profile}\n")
             except Exception:
@@ -1639,9 +1894,19 @@ def main():
     parser.add_argument("--since", type=float, default=0.0, help="Optional Unix timestamp filter for --rebind and --find-active-conv")
     parser.add_argument("--monitor-session", action="store_true", help="Run background monitor to kill agy process when quota depletes")
     parser.add_argument("--parent-pid", type=int, default=0, help="Parent PID to monitor")
+    parser.add_argument("--record-lockout", metavar="PROFILE", help="Inspect and record active quota lockout for PROFILE")
     args = parser.parse_args()
 
     selected_profile = args.profile or args.profile_flag or ""
+
+    if args.record_lockout:
+        recorded = record_profile_lockout(args.record_lockout)
+        if recorded:
+            print(f"RECORDED|{args.record_lockout}")
+            sys.exit(0)
+        else:
+            print(f"NONE|{args.record_lockout}")
+            sys.exit(1)
 
     if args.monitor_session:
         monitor_session(selected_profile, args.parent_pid, conv_id=args.conv_id, since_epoch=args.since if args.since > 0 else None)

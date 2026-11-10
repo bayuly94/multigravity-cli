@@ -727,6 +727,11 @@ start_profile_session() {
 
         [ -n "$monitor_pid" ] && kill -9 "$monitor_pid" 2>/dev/null || true
 
+        # Inspect session outcome and record quota lockout if exhausted during this run
+        if [ -n "$qbin" ]; then
+            python3 "$qbin" --record-lockout "$current_profile" >/dev/null 2>&1 || true
+        fi
+
         if [ "$enable_failover" = "1" ] && [ -n "$qbin" ]; then
             local is_exhausted=0
             local ex_pct="0.0"
