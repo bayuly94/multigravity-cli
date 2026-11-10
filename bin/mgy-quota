@@ -613,24 +613,42 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
 
     auth_headers = {"Authorization": f"Bearer {access_token}"}
     res2 = None
+    res_uqs = None
+
+    def fetch_fam(target_proj):
+        try:
+            return http_post_json(
+                "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                auth_headers,
+                {"project": target_proj},
+                timeout=10.0
+            )
+        except Exception:
+            return None
+
+    def fetch_uqs(target_proj):
+        try:
+            return http_post_json(
+                "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+                auth_headers,
+                {"project": target_proj},
+                timeout=10.0
+            )
+        except Exception:
+            return None
 
     if is_cache_fresh:
         # FAST PATH: Subscription tier is already known from cache.
-        # Skip slow loadCodeAssist completely and query available models directly!
+        # Skip slow loadCodeAssist completely and query available models & quota summary directly in parallel!
         result["tier"] = cached_tier
         proj_id = cached_proj
-        try:
-            res2 = http_post_json(
-                "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-                auth_headers,
-                {"project": proj_id},
-                timeout=10.0
-            )
-        except Exception as e:
-            result["error"] = f"API error: {e}"
-            return result
+        with ThreadPoolExecutor(max_workers=2) as inner_ex:
+            fut_fam = inner_ex.submit(fetch_fam, proj_id)
+            fut_uqs = inner_ex.submit(fetch_uqs, proj_id)
+            res2 = fut_fam.result()
+            res_uqs = fut_uqs.result()
     else:
-        # FULL / CACHE-MISS PATH: Run loadCodeAssist and fetchAvailableModels in parallel
+        # FULL / CACHE-MISS PATH: Run loadCodeAssist, fetchAvailableModels, and retrieveUserQuotaSummary in parallel
         def fetch_lca():
             try:
                 return http_post_json(
@@ -642,22 +660,13 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
             except Exception:
                 return None
 
-        def fetch_fam(target_proj):
-            return http_post_json(
-                "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-                auth_headers,
-                {"project": target_proj},
-                timeout=10.0
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as inner_ex:
+        with ThreadPoolExecutor(max_workers=3) as inner_ex:
             fut_lca = inner_ex.submit(fetch_lca)
             fut_fam = inner_ex.submit(fetch_fam, cached_proj)
+            fut_uqs = inner_ex.submit(fetch_uqs, cached_proj)
             res1 = fut_lca.result()
-            try:
-                res2 = fut_fam.result()
-            except Exception:
-                res2 = None
+            res2 = fut_fam.result()
+            res_uqs = fut_uqs.result()
 
         if res1:
             tier = (res1.get("paidTier") or {}).get("id") or (res1.get("currentTier") or {}).get("id") or "STANDARD"
@@ -689,12 +698,49 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
         if proj_id != cached_proj or res2 is None:
             try:
                 res2 = fetch_fam(proj_id)
-            except Exception as e:
-                result["error"] = f"API error: {e}"
-                return result
+            except Exception:
+                pass
+            try:
+                res_uqs = fetch_uqs(proj_id)
+            except Exception:
+                pass
 
     raw_models = res2.get("models", {}) if res2 else {}
     now_utc = datetime.now(timezone.utc)
+
+    # Parse retrieveUserQuotaSummary to detect account-level weekly subscription limits
+    user_quota_summary = res_uqs.get("groups", []) if isinstance(res_uqs, dict) else []
+    weekly_limit_depleted = False
+    weekly_limit_pct = 100.0
+    weekly_reset_str = ""
+
+    for grp in user_quota_summary:
+        for bkt in grp.get("buckets", []):
+            w = bkt.get("window", "")
+            dis = bkt.get("disabled", False)
+            rem_frac = bkt.get("remainingFraction")
+            r_str = bkt.get("resetTime")
+            if w == "weekly":
+                if rem_frac is not None:
+                    weekly_limit_pct = min(weekly_limit_pct, float(rem_frac) * 100.0)
+                if rem_frac == 0 or rem_frac is None:
+                    weekly_limit_depleted = True
+                if r_str:
+                    try:
+                        dt = datetime.fromisoformat(r_str.replace("Z", "+00:00"))
+                        diff = (dt - now_utc).total_seconds()
+                        if diff > 0:
+                            weekly_reset_str = format_duration(diff)
+                    except Exception:
+                        pass
+            elif dis is True:
+                # In Google's backend, 5h rolling window is explicitly disabled when weekly limit is breached
+                weekly_limit_depleted = True
+
+    if weekly_limit_depleted:
+        result["weekly_depleted"] = True
+        result["weekly_reset"] = weekly_reset_str
+        result["weekly_pct"] = weekly_limit_pct
 
     parsed_models = []
     critical_count = 0
@@ -736,6 +782,15 @@ def fetch_single_profile(name, profile_path, metadata_cache=None, force_refresh=
 
         rem_pct = rem_frac * 100.0
         dur_str = format_duration(reset_diff)
+
+        # CRITICAL FIX FOR GOOGLE'S TWO-TIER QUOTAS:
+        # If the account's weekly individual limit is depleted, Google disables the 5-hour limit
+        # and rejects generation requests with HTTP 429 "Individual quota reached".
+        # We override the misleading 5-hour rolling percentage to reflect the actual weekly lock!
+        if weekly_limit_depleted:
+            rem_pct = min(rem_pct, weekly_limit_pct)
+            if weekly_reset_str:
+                dur_str = weekly_reset_str
 
         if rem_pct <= 10.0:
             critical_count += 1
@@ -795,6 +850,8 @@ def render_profile_column(data, width=56, min_version_str="3.8", show_all=False)
     if low > 0:
         summary += f"  {YELLOW}● {low} low{RESET}"
     lines.append(summary)
+    if data.get("weekly_depleted"):
+        lines.append(f"  {RED}⚠ Weekly limit reached (resets in {data.get('weekly_reset', 'ready')}){RESET}")
     lines.append(f"  {DIM}{'─' * (width - 4)}{RESET}")
 
     # Group by provider
