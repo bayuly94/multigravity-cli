@@ -804,10 +804,15 @@ start_profile_session() {
                             *) failover_args+=("$a") ;;
                         esac
                     done
-                    local p_flag="-i"
-                    [ "$is_print" -eq 1 ] && p_flag="-p"
                     if [ -n "$active_conv_id" ]; then
-                        current_args=("--conversation" "$active_conv_id" "$p_flag" "/goal resume what you were doing before the quota depleted" "${failover_args[@]}")
+                        local resume_cmd="/goal resume what you were doing before the quota depleted"
+                        if [ "$is_print" -eq 1 ]; then
+                            current_args=("--conversation" "$active_conv_id" "-p" "$resume_cmd" "${failover_args[@]}")
+                        else
+                            # Interactive REPL: omit -i so agy enters prompt loop, and inject /goal in background
+                            current_args=("--conversation" "$active_conv_id" "${failover_args[@]}")
+                            python3 "$qbin" --inject-repl "$resume_cmd" --delay 1.5 >/dev/null 2>&1 &
+                        fi
                     else
                         current_args=("${failover_args[@]}")
                     fi

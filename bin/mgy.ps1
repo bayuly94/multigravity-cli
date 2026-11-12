@@ -530,7 +530,7 @@ function Rebind-ConversationArgs([string[]]$AgyArgs) {
     }
 }
 
-function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId, [string]$ResumePrompt = "/goal resume what you were doing before the quota depleted") {
+function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId, [string]$ResumePrompt = "") {
     [string[]]$filtered = @()
     $isPrint = $false
     if ($OriginalArgs) {
@@ -555,8 +555,13 @@ function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId, [string]$Res
             }
         }
     }
-    $promptFlag = if ($isPrint) { "-p" } else { "-i" }
-    return @("--conversation", $ConvId, $promptFlag, $ResumePrompt) + $filtered
+    if ($ResumePrompt) {
+        $promptFlag = if ($isPrint) { "-p" } else { "-i" }
+        return @("--conversation", $ConvId, $promptFlag, $ResumePrompt) + $filtered
+    } else {
+        # Interactive mode: omit -i so agy launches directly into the interactive REPL prompt (>)
+        return @("--conversation", $ConvId) + $filtered
+    }
 }
 
 function Show-AllDepletedAlert {
@@ -798,9 +803,22 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$A
                 if ($nextBest -and $nextBest.Profile) {
                     Write-Host "==> Dynamic Account Switch: Resuming on '$($nextBest.Profile)' [$($nextBest.Tier)] ($($nextBest.Provider): $($nextBest.TargetPct)% available)..." -ForegroundColor Green
                     if ($activeConvId) {
+                        $resumeText = "/goal resume what you were doing before the quota depleted"
                         Write-Host "==> Reopening conversation '$activeConvId' with prompt:" -ForegroundColor Cyan
-                        Write-Host "    '/goal resume what you were doing before the quota depleted'" -ForegroundColor Cyan
-                        $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId -ResumePrompt "/goal resume what you were doing before the quota depleted"
+                        Write-Host "    '$resumeText'" -ForegroundColor Cyan
+
+                        $isPrintSession = ($currentArgs -contains "-p") -or ($currentArgs -contains "--print") -or ($currentArgs -contains "--prompt")
+                        if ($isPrintSession) {
+                            $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId -ResumePrompt $resumeText
+                        } else {
+                            $currentArgs = Get-FailoverArgs -OriginalArgs $currentArgs -ConvId $activeConvId -ResumePrompt ""
+                            # Spawn background REPL injector to paste /goal into agy's > prompt and copy to clipboard
+                            if ($quotaScript) {
+                                try {
+                                    Start-Process python -ArgumentList @($quotaScript, "--inject-repl", $resumeText, "--delay", "1.5") -WindowStyle Hidden
+                                } catch {}
+                            }
+                        }
                     } else {
                         Write-Host "==> Starting new session on '$($nextBest.Profile)'..." -ForegroundColor Cyan
                     }
