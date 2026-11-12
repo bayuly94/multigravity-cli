@@ -1741,72 +1741,83 @@ def inject_terminal_repl(text: str, delay_sec: float = 1.5) -> bool:
 
     if sys.platform == "win32":
         # Windows: inject characters directly into console input buffer via WriteConsoleInputW
+        # Retry over a short window (e.g. 4 seconds) to ensure the REPL (bubbletea cancelreader)
+        # has initialized and flushed its initial startup buffer.
+        import ctypes
+        from ctypes import wintypes
+
+        class KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", wintypes.BOOL),
+                ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD),
+                ("wVirtualScanCode", wintypes.WORD),
+                ("uChar", wintypes.WCHAR),
+                ("dwControlKeyState", wintypes.DWORD),
+            ]
+
+        class INPUT_RECORD(ctypes.Structure):
+            class _EVENT(ctypes.Union):
+                _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
+            _anonymous_ = ("_EVENT",)
+            _fields_ = [
+                ("EventType", wintypes.WORD),
+                ("_EVENT", _EVENT),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        CreateFileW = kernel32.CreateFileW
+        CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        CreateFileW.restype = wintypes.HANDLE
+
+        def write_records_to_conin(records_arr):
+            h = CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+            if not h or h == -1:
+                return False
+            written = wintypes.DWORD()
+            ok = kernel32.WriteConsoleInputW(h, records_arr, len(records_arr), ctypes.byref(written))
+            kernel32.CloseHandle(h)
+            return bool(ok and written.value > 0)
+
+        chars_to_send = text + "\r"
+        records = (INPUT_RECORD * (len(chars_to_send) * 2))()
+        for i, ch in enumerate(chars_to_send):
+            vk = 0x0D if ch == "\r" else 0
+            records[i * 2].EventType = 1
+            records[i * 2].bKeyDown = True
+            records[i * 2].wRepeatCount = 1
+            records[i * 2].wVirtualKeyCode = vk
+            records[i * 2].uChar = ch
+
+            records[i * 2 + 1].EventType = 1
+            records[i * 2 + 1].bKeyDown = False
+            records[i * 2 + 1].wRepeatCount = 1
+            records[i * 2 + 1].wVirtualKeyCode = vk
+            records[i * 2 + 1].uChar = ch
+
+        # Bubbletea takes between 1.0s and 2.5s to mount and call FlushConsoleInputBuffer.
+        # We inject multiple waves: at delay_sec, delay_sec + 0.8s, and delay_sec + 1.6s
+        # Also simulate Ctrl+V via WScript.Shell
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            class KEY_EVENT_RECORD(ctypes.Structure):
-                _fields_ = [
-                    ("bKeyDown", wintypes.BOOL),
-                    ("wRepeatCount", wintypes.WORD),
-                    ("wVirtualKeyCode", wintypes.WORD),
-                    ("wVirtualScanCode", wintypes.WORD),
-                    ("uChar", wintypes.WCHAR),
-                    ("dwControlKeyState", wintypes.DWORD),
-                ]
-
-            class INPUT_RECORD(ctypes.Structure):
-                class _EVENT(ctypes.Union):
-                    _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
-                _anonymous_ = ("_EVENT",)
-                _fields_ = [
-                    ("EventType", wintypes.WORD),
-                    ("_EVENT", _EVENT),
-                ]
-
-            kernel32 = ctypes.windll.kernel32
-            CreateFileW = kernel32.CreateFileW
-            CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-            CreateFileW.restype = wintypes.HANDLE
-
-            # Open CONIN$ with GENERIC_READ | GENERIC_WRITE and FILE_SHARE_READ | FILE_SHARE_WRITE
-            hConIn = CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
-            if hConIn and hConIn != -1:
-                # Append newline so the slash command executes automatically
-                chars_to_send = text + "\r"
-                records = (INPUT_RECORD * (len(chars_to_send) * 2))()
-                for i, ch in enumerate(chars_to_send):
-                    vk = 0x0D if ch == "\r" else 0
-                    # Key down
-                    records[i * 2].EventType = 1
-                    records[i * 2].bKeyDown = True
-                    records[i * 2].wRepeatCount = 1
-                    records[i * 2].wVirtualKeyCode = vk
-                    records[i * 2].uChar = ch
-                    # Key up
-                    records[i * 2 + 1].EventType = 1
-                    records[i * 2 + 1].bKeyDown = False
-                    records[i * 2 + 1].wRepeatCount = 1
-                    records[i * 2 + 1].wVirtualKeyCode = vk
-                    records[i * 2 + 1].uChar = ch
-
-                written = wintypes.DWORD()
-                ok = kernel32.WriteConsoleInputW(hConIn, records, len(records), ctypes.byref(written))
-                kernel32.CloseHandle(hConIn)
-                if ok and written.value > 0:
-                    success = True
+            write_records_to_conin(records)
+            success = True
         except Exception:
             pass
 
-        # Also trigger WScript.Shell SendKeys or user32 Enter if console buffer didn't register
-        if not success:
-            try:
-                # Fallback to powershell SendWait
-                ps_cmd = f"$wshell = New-Object -ComObject WScript.Shell; Start-Sleep -Milliseconds 200; $wshell.SendKeys('{text}{{ENTER}}')"
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=3.0, capture_output=True)
-                success = True
-            except Exception:
-                pass
+        # Try a second wave slightly later to catch REPL after it flushes boot input
+        time.sleep(1.0)
+        try:
+            write_records_to_conin(records)
+        except Exception:
+            pass
+
+        # Also trigger WScript.Shell SendKeys
+        try:
+            ps_cmd = "$wshell = New-Object -ComObject WScript.Shell; $wshell.SendKeys('^v{ENTER}')"
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=3.0, capture_output=True)
+            success = True
+        except Exception:
+            pass
     else:
         # Linux / macOS / Raspberry Pi: inject into controlling tty if supported
         try:
@@ -1856,10 +1867,19 @@ def main():
     parser.add_argument("--parent-pid", type=int, default=0, help="Parent PID to monitor")
     parser.add_argument("--record-lockout", metavar="PROFILE", help="Inspect and record active quota lockout for PROFILE")
     parser.add_argument("--inject-repl", type=str, metavar="PROMPT", help="Inject prompt text into active interactive agy REPL")
+    parser.add_argument("--inject-repl-b64", type=str, metavar="B64_PROMPT", help="Inject base64-encoded prompt text into active interactive agy REPL")
     parser.add_argument("--delay", type=float, default=1.5, help="Delay in seconds before REPL injection (default: 1.5)")
     args = parser.parse_args()
 
     selected_profile = args.profile or args.profile_flag or ""
+
+    if args.inject_repl_b64:
+        try:
+            raw_text = base64.b64decode(args.inject_repl_b64.encode("ascii")).decode("utf-8")
+            ok = inject_terminal_repl(raw_text, delay_sec=args.delay)
+            sys.exit(0 if ok else 1)
+        except Exception:
+            sys.exit(1)
 
     if args.inject_repl:
         ok = inject_terminal_repl(args.inject_repl, delay_sec=args.delay)

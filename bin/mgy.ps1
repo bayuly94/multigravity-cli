@@ -728,7 +728,8 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$A
             Write-Host "==> Detected '/goal' command passed via CLI flag." -ForegroundColor Cyan
             Write-Host "    Redirecting directly into interactive REPL: '$interceptedGoal'" -ForegroundColor Cyan
             try {
-                Start-Process python -ArgumentList @($quotaScript, "--inject-repl", $interceptedGoal, "--delay", "1.5") -WindowStyle Hidden
+                $b64Goal = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($interceptedGoal))
+                Start-Process python -ArgumentList @($quotaScript, "--inject-repl-b64", $b64Goal, "--delay", "1.5") -WindowStyle Hidden
             } catch {}
         }
 
@@ -853,7 +854,8 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$A
                             # Spawn background REPL injector to paste /goal into agy's > prompt and copy to clipboard
                             if ($quotaScript) {
                                 try {
-                                    Start-Process python -ArgumentList @($quotaScript, "--inject-repl", $resumeText, "--delay", "1.5") -WindowStyle Hidden
+                                    $b64Resume = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($resumeText))
+                                    Start-Process python -ArgumentList @($quotaScript, "--inject-repl-b64", $b64Resume, "--delay", "1.5") -WindowStyle Hidden
                                 } catch {}
                             }
                         }
