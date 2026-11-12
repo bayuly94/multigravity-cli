@@ -1615,7 +1615,7 @@ def rebind_conversation_trajectory(conv_target, since_epoch=None):
     import sqlite3
     import uuid
 
-    if not conv_target or conv_target.lower() in ("latest", "-c", "--continue"):
+    if not conv_target or conv_target.lower() in ("latest", "--continue"):
         conv_id = find_latest_conversation_id(since_epoch=since_epoch)
     else:
         conv_id = conv_target.strip()
@@ -1866,23 +1866,42 @@ end tell
             pass
     else:
         # Linux / Raspberry Pi: inject into controlling tty if supported
+        clean_text = text.rstrip("\r\n").replace("\r\n", "\n").replace("\r", "\n")
+        bytes_to_send = clean_text.encode("utf-8") + b"\r"
         try:
             import fcntl
             import termios
-            chars_to_send = text + "\n"
             for tty_path in ["/dev/tty", sys.stdin.name if hasattr(sys.stdin, "name") else None]:
                 if not tty_path:
                     continue
                 try:
                     with open(tty_path, "w") as tty:
-                        for ch in chars_to_send:
-                            fcntl.ioctl(tty.fileno(), termios.TIOCSTI, ch)
+                        for b in bytes_to_send:
+                            fcntl.ioctl(tty.fileno(), termios.TIOCSTI, bytes([b]))
                         success = True
                         break
                 except Exception:
                     continue
         except Exception:
             pass
+
+        if not success:
+            # Fallback for systems where TIOCSTI is restricted (e.g. Linux 6.2+ legacy_tiocsti=0)
+            # Try xdotool (X11) or wtype (Wayland)
+            import shutil
+            try:
+                if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wtype"):
+                    subprocess.run(["wtype", clean_text], timeout=3.0, capture_output=True)
+                    time.sleep(0.05)
+                    subprocess.run(["wtype", "-k", "Return"], timeout=2.0, capture_output=True)
+                    success = True
+                elif os.environ.get("DISPLAY") and shutil.which("xdotool"):
+                    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "0", clean_text], timeout=3.0, capture_output=True)
+                    time.sleep(0.05)
+                    subprocess.run(["xdotool", "key", "Return"], timeout=2.0, capture_output=True)
+                    success = True
+            except Exception:
+                pass
 
     return success
 

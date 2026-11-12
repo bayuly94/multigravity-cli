@@ -144,26 +144,26 @@ Commands:
   help, --help, -h       Show this help message
   <profile> [agy args]   Start agy session using the specified profile
 
-Resume & Conversation Flags (same as agy):
+Resume & Conversation Flags:
   mgy auto                            Start session with dynamic quota switching & auto-resume
-  mgy auto -c                         Continue latest conversation with dynamic quota switching
+  mgy auto --continue                 Continue latest conversation with dynamic quota switching
   mgy resume [conv_id]                Resume latest (or specified) conversation on best profile
-  mgy <profile> --conversation=<id>   Resume a specific conversation by ID (auto-rebinds trajectory)
-  mgy <profile> -c, --continue        Continue the most recent conversation (auto-rebinds trajectory)
+  mgy <profile> -c, --conversation=<id> Resume a specific conversation by ID (auto-rebinds trajectory)
+  mgy <profile> --continue            Continue the most recent conversation (auto-rebinds trajectory)
 
 Examples:
   mgy auto                     # Dynamic quota switching: auto-kills on 429 and resumes next best account
-  mgy auto -c                  # Continue latest chat with dynamic auto-failover
+  mgy auto --continue          # Continue latest chat with dynamic auto-failover
   mgy resume <id>              # Rebind SQLite trajectory and resume chat on best profile
   mgy new work                 # Set up a new profile with Google login
   mgy list                     # List all registered profiles
-  mgy fork --conversation=<id> # Fork conversation across all profiles
+  mgy fork -c <id>             # Fork conversation across all profiles
   mgy export <id> [path.tar.gz] # Export conversation to a portable archive
   mgy import <path.tar.gz>      # Import conversation archive into agy
   mgy import-conversation <archive> # (Alias) Import conversation archive
   mgy work                     # Start interactive agy session with profile
-  mgy work -c                  # Continue latest chat under profile
-  mgy work --conversation=<id> # Resume specific conversation by ID
+  mgy work --continue          # Continue latest chat under profile
+  mgy work -c <id>             # Resume specific conversation by ID (-c is alias for --conversation)
   mgy conversations            # View list of recent conversation IDs
   mgy quotas                   # Inspect Gemini 3.8+ quotas across all profiles
   mgy quotas -a                # Inspect all models (including Claude and OpenAI)
@@ -483,12 +483,22 @@ function Rebind-ConversationArgs([string[]]$AgyArgs) {
             if ($arg -match "^--conversation=(.+)$") {
                 $activeConvId = $matches[1]
                 $updatedArgs += $arg
-            } elseif ($arg -eq "--conversation" -and ($i + 1) -lt $AgyArgs.Count) {
+            } elseif ($arg -match "^-c=(.+)$") {
+                $activeConvId = $matches[1]
+                $updatedArgs += "--conversation=$activeConvId"
+            } elseif ($arg -eq "--conversation" -and ($i + 1) -lt $AgyArgs.Count -and ($AgyArgs[$i + 1] -notmatch "^-")) {
                 $activeConvId = $AgyArgs[$i + 1]
                 $updatedArgs += $arg
                 $updatedArgs += $activeConvId
                 $i++
-            } elseif ($arg -in @("-c", "--continue")) {
+            } elseif ($arg -eq "-c" -and ($i + 1) -lt $AgyArgs.Count -and ($AgyArgs[$i + 1] -notmatch "^-")) {
+                $activeConvId = $AgyArgs[$i + 1]
+                $updatedArgs += "--conversation"
+                $updatedArgs += $activeConvId
+                $i++
+            } elseif ($arg -eq "-c") {
+                $updatedArgs += "--conversation"
+            } elseif ($arg -eq "--continue") {
                 $needsLatest = $true
                 $updatedArgs += $arg
             } else {
@@ -510,7 +520,7 @@ function Rebind-ConversationArgs([string[]]$AgyArgs) {
                     [string[]]$rewritten = @()
                     $replaced = $false
                     foreach ($a in $updatedArgs) {
-                        if (-not $replaced -and ($a -in @("-c", "--continue"))) {
+                        if (-not $replaced -and $a -eq "--continue") {
                             $rewritten += "--conversation"
                             $rewritten += $activeConvId
                             $replaced = $true
@@ -541,7 +551,7 @@ function Get-FailoverArgs([string[]]$OriginalArgs, [string]$ConvId, [string]$Res
             } elseif ($arg -eq "--conversation") {
                 $i++
                 continue
-            } elseif ($arg -in @("-c", "--continue")) {
+            } elseif ($arg -eq "--continue") {
                 continue
             } elseif ($arg -in @("-i", "--prompt-interactive")) {
                 $i++
@@ -888,10 +898,10 @@ switch -Wildcard ($Command) {
     "fork" {
         $convId = $null
         for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
-            if ($RemainingArgs[$i] -match "^--conversation=(.+)$") {
-                $convId = $matches[1]
+            if ($RemainingArgs[$i] -match "^(--conversation|-c)=(.+)$") {
+                $convId = $matches[2]
                 break
-            } elseif ($RemainingArgs[$i] -eq "--conversation" -and ($i + 1) -lt $RemainingArgs.Count) {
+            } elseif (($RemainingArgs[$i] -eq "--conversation" -or $RemainingArgs[$i] -eq "-c") -and ($i + 1) -lt $RemainingArgs.Count) {
                 $convId = $RemainingArgs[$i + 1]
                 break
             } elseif (-not $convId -and $RemainingArgs[$i] -notmatch "^-") {
@@ -1049,9 +1059,9 @@ except Exception:
         $outputTar = $null
 
         for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
-            if ($RemainingArgs[$i] -match "^--conversation=(.+)$") {
-                $convId = $matches[1]
-            } elseif ($RemainingArgs[$i] -eq "--conversation" -and ($i + 1) -lt $RemainingArgs.Count) {
+            if ($RemainingArgs[$i] -match "^(--conversation|-c)=(.+)$") {
+                $convId = $matches[2]
+            } elseif (($RemainingArgs[$i] -eq "--conversation" -or $RemainingArgs[$i] -eq "-c") -and ($i + 1) -lt $RemainingArgs.Count) {
                 $convId = $RemainingArgs[$i + 1]
                 $i++
             } elseif (-not $convId -and $RemainingArgs[$i] -notmatch "^-") {
@@ -1387,12 +1397,12 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
         [string[]]$resumeArgs = @()
 
         if ($RemainingArgs.Count -eq 0) {
-            $resumeArgs = @("-c")
+            $resumeArgs = @("--continue")
         } elseif ((Test-Path (Join-Path $ProfilesDir $RemainingArgs[0])) -and ($RemainingArgs[0] -notmatch "^-")) {
             $targetProf = $RemainingArgs[0]
             $rest = @($RemainingArgs | Select-Object -Skip 1)
             if ($rest.Count -eq 0) {
-                $resumeArgs = @("-c")
+                $resumeArgs = @("--continue")
             } elseif ($rest[0] -notmatch "^-") {
                 $resumeArgs = @("--conversation", $rest[0]) + @($rest | Select-Object -Skip 1)
             } else {
@@ -1419,7 +1429,7 @@ with tarfile.open(abs_tar, 'w:gz', compresslevel=1) as tar:
     }
 
     "-*" {
-        # Flags passed without explicit profile name (e.g. mgy -c, mgy --conversation=<id>)
+        # Flags passed without explicit profile name (e.g. mgy -c <id>, mgy --conversation=<id>, mgy --continue)
         $allArgs = @($Command) + $RemainingArgs
         $selectedProfile = $env:MULTIGRAVITY_DEFAULT_PROFILE
         if (-not $selectedProfile -or -not (Test-Path (Join-Path $ProfilesDir $selectedProfile))) {

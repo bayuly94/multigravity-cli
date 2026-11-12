@@ -32,26 +32,26 @@ Commands:
   help, --help, -h       Show this help message
   <profile> [agy args]   Start agy session using the specified profile
 
-Resume & Conversation Flags (same as agy):
+Resume & Conversation Flags:
   $CMD_NAME auto                            Start session with dynamic quota switching & auto-resume
-  $CMD_NAME auto -c                         Continue latest conversation with dynamic quota switching
+  $CMD_NAME auto --continue                 Continue latest conversation with dynamic quota switching
   $CMD_NAME resume [conv_id]                Resume latest (or specified) conversation on best profile
-  $CMD_NAME <profile> --conversation=<id>   Resume a specific conversation by ID (auto-rebinds trajectory)
-  $CMD_NAME <profile> -c, --continue        Continue the most recent conversation (auto-rebinds trajectory)
+  $CMD_NAME <profile> -c, --conversation=<id> Resume a specific conversation by ID (auto-rebinds trajectory)
+  $CMD_NAME <profile> --continue            Continue the most recent conversation (auto-rebinds trajectory)
 
 Examples:
   $CMD_NAME auto                          # Dynamic quota switching: auto-kills on 429 and resumes next best account
-  $CMD_NAME auto -c                       # Continue latest chat with dynamic auto-failover
+  $CMD_NAME auto --continue               # Continue latest chat with dynamic auto-failover
   $CMD_NAME resume <id>                   # Rebind SQLite trajectory and resume chat on best profile
   $CMD_NAME new <profile>                 # Set up a new profile with Google login
   $CMD_NAME list                          # List all registered profiles
-  $CMD_NAME fork --conversation=<id>      # Fork conversation across all profiles
+  $CMD_NAME fork -c <id>                  # Fork conversation across all profiles
   $CMD_NAME export <id> [path.tar.gz]     # Export conversation to a portable archive
   $CMD_NAME import <path.tar.gz>          # Import conversation archive into agy
   $CMD_NAME import-conversation <archive> # (Alias) Import conversation archive
   $CMD_NAME <profile>                     # Start interactive agy session with profile
-  $CMD_NAME <profile> -c                  # Continue latest chat under profile
-  $CMD_NAME <profile> --conversation=<id> # Resume specific conversation by ID
+  $CMD_NAME <profile> --continue          # Continue latest chat under profile
+  $CMD_NAME <profile> -c <id>             # Resume specific conversation by ID (-c is alias for --conversation)
   $CMD_NAME conversations                 # View list of recent conversation IDs
   $CMD_NAME quotas                        # Inspect Gemini 3.8+ quotas across all profiles
   $CMD_NAME quotas -a                     # Inspect all models (including Claude and OpenAI)
@@ -337,11 +337,11 @@ export_conversation_handler() {
                 echo "Exports an Antigravity conversation and its artifacts to a portable tar.gz archive."
                 exit 0
                 ;;
-            --conversation=*)
+            --conversation=*|-c=*)
                 conv_id="${1#*=}"
                 shift
                 ;;
-            --conversation)
+            --conversation|-c)
                 conv_id="$2"
                 shift 2
                 ;;
@@ -713,22 +713,56 @@ start_profile_session() {
             fi
         fi
 
-        # Detect and rebind SQLite trajectory_meta if resuming an existing conversation (--conversation or -c)
+        # Detect and rebind SQLite trajectory_meta if resuming an existing conversation (-c / --conversation or --continue)
         local active_conv_id=""
         local needs_latest=0
-        local prev=""
-        for a in "${current_args[@]}"; do
-            if [ "$prev" = "--conversation" ]; then
-                active_conv_id="$a"
-                prev=""
+        local normalized_args=()
+        local skip_next_conv=0
+        for ((idx=0; idx<${#current_args[@]}; idx++)); do
+            if [ "$skip_next_conv" -eq 1 ]; then
+                skip_next_conv=0
                 continue
             fi
+            local a="${current_args[idx]}"
             case "$a" in
-                --conversation=*) active_conv_id="${a#--conversation=}" ;;
-                --conversation) prev="--conversation" ;;
-                -c|--continue) needs_latest=1 ;;
+                --conversation=*)
+                    active_conv_id="${a#--conversation=}"
+                    normalized_args+=("$a")
+                    ;;
+                -c=*)
+                    active_conv_id="${a#-c=}"
+                    normalized_args+=("--conversation=$active_conv_id")
+                    ;;
+                --conversation)
+                    local next_a="${current_args[idx+1]}"
+                    if [ -n "$next_a" ] && [[ "$next_a" != -* ]]; then
+                        active_conv_id="$next_a"
+                        normalized_args+=("--conversation" "$next_a")
+                        skip_next_conv=1
+                    else
+                        normalized_args+=("$a")
+                    fi
+                    ;;
+                -c)
+                    local next_a="${current_args[idx+1]}"
+                    if [ -n "$next_a" ] && [[ "$next_a" != -* ]]; then
+                        active_conv_id="$next_a"
+                        normalized_args+=("--conversation" "$next_a")
+                        skip_next_conv=1
+                    else
+                        normalized_args+=("--conversation")
+                    fi
+                    ;;
+                --continue)
+                    needs_latest=1
+                    normalized_args+=("$a")
+                    ;;
+                *)
+                    normalized_args+=("$a")
+                    ;;
             esac
         done
+        current_args=("${normalized_args[@]}")
 
         if [ -n "$qbin" ]; then
             if [ -n "$active_conv_id" ]; then
@@ -741,7 +775,7 @@ start_profile_session() {
                     local rewritten=()
                     local replaced=0
                     for a in "${current_args[@]}"; do
-                        if [ "$replaced" -eq 0 ] && { [ "$a" = "-c" ] || [ "$a" = "--continue" ]; }; then
+                        if [ "$replaced" -eq 0 ] && [ "$a" = "--continue" ]; then
                             rewritten+=("--conversation" "$active_conv_id")
                             replaced=1
                         else
@@ -770,7 +804,15 @@ start_profile_session() {
         if [ -n "$intercepted_goal" ] && [ -n "$qbin" ]; then
             echo "==> Detected '/goal' command passed via CLI flag."
             echo "    Redirecting directly into interactive REPL: '$intercepted_goal'"
-            python3 "$qbin" --inject-repl "$intercepted_goal" --delay 1.5 >/dev/null 2>&1 &
+            local b64_goal=""
+            if command -v base64 >/dev/null 2>&1; then
+                b64_goal="$(printf '%s' "$intercepted_goal" | base64 | tr -d '\r\n')"
+            fi
+            if [ -n "$b64_goal" ]; then
+                python3 "$qbin" --inject-repl-b64 "$b64_goal" --delay 1.5 >/dev/null 2>&1 &
+            else
+                python3 "$qbin" --inject-repl "$intercepted_goal" --delay 1.5 >/dev/null 2>&1 &
+            fi
         fi
 
         activate_profile_keychain "$target_dir"
@@ -868,7 +910,15 @@ start_profile_session() {
                         else
                             # Interactive REPL: omit -i so agy enters prompt loop, and inject /goal in background
                             current_args=("--conversation" "$active_conv_id" "${failover_args[@]}")
-                            python3 "$qbin" --inject-repl "$resume_cmd" --delay 1.5 >/dev/null 2>&1 &
+                            local b64_resume=""
+                            if command -v base64 >/dev/null 2>&1; then
+                                b64_resume="$(printf '%s' "$resume_cmd" | base64 | tr -d '\r\n')"
+                            fi
+                            if [ -n "$b64_resume" ]; then
+                                python3 "$qbin" --inject-repl-b64 "$b64_resume" --delay 1.5 >/dev/null 2>&1 &
+                            else
+                                python3 "$qbin" --inject-repl "$resume_cmd" --delay 1.5 >/dev/null 2>&1 &
+                            fi
                         fi
                     else
                         current_args=("${failover_args[@]}")
@@ -972,11 +1022,11 @@ case "$1" in
         CONV_ID=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --conversation=*)
+                --conversation=*|-c=*)
                     CONV_ID="${1#*=}"
                     shift
                     ;;
-                --conversation)
+                --conversation|-c)
                     CONV_ID="$2"
                     shift 2
                     ;;
@@ -1222,12 +1272,12 @@ EOF
         target_prof=""
         declare -a resume_args=()
         if [ $# -eq 0 ]; then
-            resume_args=("-c")
+            resume_args=("--continue")
         elif [ -d "$PROFILES_DIR/$1" ] && [[ "$1" != -* ]]; then
             target_prof="$1"
             shift
             if [ $# -eq 0 ]; then
-                resume_args=("-c")
+                resume_args=("--continue")
             elif [[ "$1" != -* ]]; then
                 resume_args=("--conversation" "$1" "${@:2}")
             else
@@ -1255,7 +1305,7 @@ EOF
         ;;
 
     -*)
-        # Flags passed without an explicit profile name (e.g. mgy --conversation=<id>, mgy -c)
+        # Flags passed without an explicit profile name (e.g. mgy --conversation=<id>, mgy -c <id>, mgy --continue)
         if [ -n "$MULTIGRAVITY_DEFAULT_PROFILE" ] && [ -d "$PROFILES_DIR/$MULTIGRAVITY_DEFAULT_PROFILE" ]; then
             SELECTED_PROFILE="$MULTIGRAVITY_DEFAULT_PROFILE"
         else

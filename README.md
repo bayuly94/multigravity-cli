@@ -57,7 +57,7 @@ When launching a session with `mgy <profile>`, the environment redirects `HOME` 
 ```
 
 > [!NOTE]
-> - **Unified History & Memory**: Because `.gemini/antigravity-cli` is shared across all profiles, all your conversations, chat summaries, CLI settings, prompt history (`history.jsonl`), and MCP servers are always preserved. You can resume any conversation across different accounts seamlessly (`mgy <profile> -c`).
+> - **Unified History & Memory**: Because `.gemini/antigravity-cli` is shared across all profiles, all your conversations, chat summaries, CLI settings, prompt history (`history.jsonl`), and MCP servers are always preserved. You can resume any conversation across different accounts seamlessly (`mgy <profile> -c <id>` or `mgy <profile> --continue`).
 > - **Isolated Credentials & Quota**: Each profile maintains its own isolated OAuth token. When you switch profiles, you draw from that specific account's quota limits without affecting others or losing any context.
 > - **Preserved Identity**: Host `.gitconfig` and `.ssh` are linked across all profiles, ensuring git commits always retain your author name and email.
 > - **Windows Native**: On Windows, NTFS Directory Junctions are utilized instead of symlinks, requiring **no Administrator privileges** or Developer Mode. Both `%USERPROFILE%` and `$HOME` are dynamically isolated.
@@ -143,9 +143,10 @@ Both instances execute simultaneously with full token and quota isolation while 
 mgy auto
 
 # Continue the latest conversation with auto-switching:
-mgy auto -c
+mgy auto --continue
 
-# Resume a specific conversation with auto-switching:
+# Resume a specific conversation with auto-switching (-c is alias for --conversation):
+mgy auto -c <conversation_id>
 mgy auto --conversation <conversation_id>
 
 # Run non-interactively or with custom flags:
@@ -154,21 +155,22 @@ mgy auto -p "Implement the user auth module" --dangerously-skip-permissions
 *(Note: `mgy best` is an alias for `mgy auto`)*
 
 #### Resuming Conversations Across Profiles & Automatic Failover
-Because conversations and history are shared globally, you can resume any conversation under any account. `mgy` automatically rebinds `trajectory_meta` in SQLite when resuming (`--conversation` or `-c`) so switching accounts never causes trajectory ownership collisions, and automatically fails over to the next profile with available quota if your active profile hits `0%` quota:
+Because conversations and history are shared globally, you can resume any conversation under any account. `mgy` automatically rebinds `trajectory_meta` in SQLite when resuming (`-c <id>`, `--conversation=<id>`, or `--continue`) so switching accounts never causes trajectory ownership collisions, and automatically fails over to the next profile with available quota if your active profile hits `0%` quota:
 
 ```bash
 # View recent conversation IDs:
 mgy conversations
 
-# Resume a specific conversation by ID (auto-rebinds trajectory metadata):
+# Resume a specific conversation by ID (-c is an alias for --conversation):
+mgy <profile_1> -c <conversation_id>
 mgy <profile_1> --conversation=<conversation_id>
 
 # Resume that SAME conversation under another profile to use a different quota:
-mgy <profile_2> --conversation=<conversation_id>
+mgy <profile_2> -c <conversation_id>
 
 # Continue the most recent conversation on the best available profile:
-mgy -c
-mgy <profile_1> -c
+mgy --continue
+mgy <profile_1> --continue
 mgy <profile_2> --continue
 ```
 
@@ -246,8 +248,8 @@ Both `mgy` and `multigravity` can be used interchangeably:
 | :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
 | `mgy auto [args...]`, `mgy best`    | Starts `agy` on the highest quota profile; on quota exhaustion, kills process, switches accounts, and resumes automatically with `/goal resume...` |
 | `mgy resume [conv_id] [args...]`    | Rebinds `trajectory_meta` in SQLite and resumes the conversation on the profile with the highest remaining quota.                |
-| `mgy <profile> --conversation=<id>` | Rebinds `trajectory_meta` and resumes a specific conversation by ID (same as `agy --conversation=<id>`).                         |
-| `mgy <profile> -c`, `--continue`    | Continues the most recent conversation (auto-rebinding `trajectory_meta`).                                                       |
+| `mgy <profile> -c <id>`, `--conversation=<id>` | Rebinds `trajectory_meta` and resumes a specific conversation by ID (`-c` is alias for `--conversation`). |
+| `mgy <profile> --continue`          | Continues the most recent conversation (auto-rebinding `trajectory_meta`).                                                       |
 | `mgy conversations`                 | Lists recent conversation IDs, titles, and activity timestamps.                                                                  |
 | `mgy export <id> [tar_path]`        | Exports a conversation, session SQLite DB, trajectory, and artifacts to a portable `.tar.gz` archive.                             |
 | `mgy import <profile|tar_path>`     | Imports a conversation archive (`.tar.gz` / `.zip`) into `~/.gemini/antigravity-cli` OR imports the host session into a profile.   |
