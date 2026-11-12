@@ -1811,10 +1811,20 @@ def inject_terminal_repl(text: str, delay_sec: float = 1.5) -> bool:
         except Exception:
             pass
 
-        # Also trigger WScript.Shell SendKeys
+        # In Windows Terminal, pasting (> 5 KiB or multiline) opens a safety dialog:
+        # "You are about to paste text that is very large (more than 5 KiB)..."
+        # Pressing Enter the first time confirms the paste dialog ("Paste anyway"),
+        # and pressing Enter a second time submits the pasted command to the agy prompt.
         try:
-            ps_cmd = "$wshell = New-Object -ComObject WScript.Shell; $wshell.SendKeys('^v{ENTER}')"
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=3.0, capture_output=True)
+            ps_cmd = (
+                "$wshell = New-Object -ComObject WScript.Shell; "
+                "$wshell.SendKeys('^v'); "
+                "Start-Sleep -Milliseconds 300; "
+                "$wshell.SendKeys('{ENTER}'); "
+                "Start-Sleep -Milliseconds 400; "
+                "$wshell.SendKeys('{ENTER}')"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=4.0, capture_output=True)
             success = True
         except Exception:
             pass
