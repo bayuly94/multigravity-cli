@@ -666,6 +666,53 @@ start_profile_session() {
 
         setup_profile_environment "$target_dir"
 
+        # Intercept /goal passed via -i, --prompt-interactive, -p, --print, or --prompt
+        # agy cannot parse slash commands when passed via CLI flags; it only recognizes them at the interactive REPL prompt (>).
+        # We strip the flag from agy args, copy the command to the clipboard, and inject it directly into the REPL buffer.
+        local intercepted_goal=""
+        if [ "${#current_args[@]}" -gt 0 ]; then
+            local stripped_args=()
+            local skip_next=0
+            for ((idx=0; idx<${#current_args[@]}; idx++)); do
+                local argItem="${current_args[idx]}"
+                if [ "$skip_next" -eq 1 ]; then
+                    skip_next=0
+                    continue
+                fi
+                case "$argItem" in
+                    -i|--prompt-interactive|-p|--print|--prompt)
+                        local nextVal="${current_args[idx+1]}"
+                        local trimmed="${nextVal#"${nextVal%%[![:space:]]*}"}"
+                        if [[ "$trimmed" == "/goal"* ]]; then
+                            intercepted_goal="$nextVal"
+                            skip_next=1
+                            continue
+                        fi
+                        stripped_args+=("$argItem")
+                        ;;
+                    -i=*|--prompt-interactive=*|-p=*|--print=*|--prompt=*)
+                        local valPart="${argItem#*=}"
+                        valPart="${valPart#\"}"
+                        valPart="${valPart%\"}"
+                        valPart="${valPart#\'}"
+                        valPart="${valPart%\'}"
+                        local trimmed="${valPart#"${valPart%%[![:space:]]*}"}"
+                        if [[ "$trimmed" == "/goal"* ]]; then
+                            intercepted_goal="$valPart"
+                            continue
+                        fi
+                        stripped_args+=("$argItem")
+                        ;;
+                    *)
+                        stripped_args+=("$argItem")
+                        ;;
+                esac
+            done
+            if [ -n "$intercepted_goal" ]; then
+                current_args=("${stripped_args[@]}")
+            fi
+        fi
+
         # Detect and rebind SQLite trajectory_meta if resuming an existing conversation (--conversation or -c)
         local active_conv_id=""
         local needs_latest=0
@@ -719,13 +766,23 @@ start_profile_session() {
             monitor_pid=$!
         fi
 
+        # Trigger REPL injection if /goal was passed via -i or -p
+        if [ -n "$intercepted_goal" ] && [ -n "$qbin" ]; then
+            echo "==> Detected '/goal' command passed via CLI flag."
+            echo "    Redirecting directly into interactive REPL: '$intercepted_goal'"
+            python3 "$qbin" --inject-repl "$intercepted_goal" --delay 1.5 >/dev/null 2>&1 &
+        fi
+
         activate_profile_keychain "$target_dir"
         echo "Starting agy with profile '$current_profile'..."
         USERPROFILE="$target_dir" HOME="$target_dir" agy "${current_args[@]}"
         local status=$?
         restore_profile_keychain "$target_dir"
 
-        [ -n "$monitor_pid" ] && kill -9 "$monitor_pid" 2>/dev/null || true
+        if [ -n "$monitor_pid" ]; then
+            kill -9 "$monitor_pid" 2>/dev/null || true
+            wait "$monitor_pid" 2>/dev/null || true
+        fi
 
         # Inspect session outcome and record quota lockout if exhausted during this run
         if [ -n "$qbin" ]; then
