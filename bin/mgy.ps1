@@ -614,6 +614,35 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$A
 
         Setup-ProfileEnvironment -TargetDir $targetDir
 
+        # Intercept /goal passed via -i, --prompt-interactive, -p, --print, or --prompt
+        # agy cannot parse slash commands when passed via CLI flags; it only recognizes them at the interactive REPL prompt (>).
+        # We strip the flag from agy args, copy the command to the clipboard, and inject it directly into the REPL buffer.
+        $interceptedGoal = $null
+        if ($currentArgs) {
+            [string[]]$strippedArgs = @()
+            for ($idx = 0; $idx -lt $currentArgs.Count; $idx++) {
+                $argItem = $currentArgs[$idx]
+                if ($argItem -in @("-i", "--prompt-interactive", "-p", "--print", "--prompt") -and ($idx + 1) -lt $currentArgs.Count) {
+                    $nextVal = $currentArgs[$idx + 1]
+                    if ($nextVal.TrimStart().StartsWith("/goal")) {
+                        $interceptedGoal = $nextVal
+                        $idx++
+                        continue
+                    }
+                } elseif ($argItem -match "^(--prompt-interactive|-i|--print|-p|--prompt)=(.+)$") {
+                    $valPart = $matches[2].Trim('"', "'")
+                    if ($valPart.TrimStart().StartsWith("/goal")) {
+                        $interceptedGoal = $valPart
+                        continue
+                    }
+                }
+                $strippedArgs += $argItem
+            }
+            if ($interceptedGoal) {
+                $currentArgs = $strippedArgs
+            }
+        }
+
         # Rebind SQLite trajectory_meta if resuming an existing conversation (--conversation or -c)
         $rebound = Rebind-ConversationArgs -AgyArgs $currentArgs
         $currentArgs = $rebound.Args
@@ -691,6 +720,15 @@ function Start-ProfileSession([string]$ProfileName, [string[]]$AgyArgs, [bool]$A
                     $monArgs += @("--conv-id", $activeConvId)
                 }
                 $monitorProc = Start-Process python -ArgumentList $monArgs -WindowStyle Hidden -PassThru
+            } catch {}
+        }
+
+        # Trigger REPL injection if /goal was passed via -i or -p
+        if ($interceptedGoal -and $quotaScript) {
+            Write-Host "==> Detected '/goal' command passed via CLI flag." -ForegroundColor Cyan
+            Write-Host "    Redirecting directly into interactive REPL: '$interceptedGoal'" -ForegroundColor Cyan
+            try {
+                Start-Process python -ArgumentList @($quotaScript, "--inject-repl", $interceptedGoal, "--delay", "1.5") -WindowStyle Hidden
             } catch {}
         }
 
